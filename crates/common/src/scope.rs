@@ -72,6 +72,10 @@ pub fn data_home() -> PathBuf {
     xdg("XDG_DATA_HOME", ".local/share")
 }
 
+pub fn state_home() -> PathBuf {
+    xdg("XDG_STATE_HOME", ".local/state")
+}
+
 /// `~/…` and relative paths, resolved against `base`.
 pub fn expand(path: &str, base: &Path) -> PathBuf {
     if path == "~" {

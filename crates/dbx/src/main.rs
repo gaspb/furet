@@ -1,5 +1,6 @@
 mod config;
 mod conn;
+mod engine;
 mod picker;
 mod tunnel;
 
@@ -121,6 +122,18 @@ enum Cmd {
     },
     /// Set up an integration: `herdr` gives dbx its own name and icon in the herdr app
     Setup { target: Integration },
+    /// The local engine behind the herdr panel (127.0.0.1, token-protected)
+    Serve {
+        /// Start it in the background unless it's running; print its url and token as JSON
+        #[arg(long)]
+        ensure: bool,
+        /// Stop the running server (its sessions and tunnels close)
+        #[arg(long, conflicts_with = "ensure")]
+        stop: bool,
+        /// Stop after this many idle minutes with no session open
+        #[arg(long, default_value_t = 60)]
+        idle_minutes: u64,
+    },
 }
 
 #[derive(Clone, ValueEnum)]
@@ -190,6 +203,25 @@ fn command(cmd: Cmd, cwd: &Path) -> Result<i32> {
         Cmd::Edit { global } => edit(&target_file(cwd, global)?, global),
         Cmd::Path { global } => {
             println!("{}", target_file(cwd, global)?.display());
+            Ok(0)
+        }
+        Cmd::Serve { stop: true, .. } => {
+            println!(
+                "{}",
+                if engine::server::stop() {
+                    "stopped"
+                } else {
+                    "not running"
+                }
+            );
+            Ok(0)
+        }
+        Cmd::Serve { ensure: true, .. } => {
+            println!("{}", serde_json::to_string(&engine::server::ensure()?)?);
+            Ok(0)
+        }
+        Cmd::Serve { idle_minutes, .. } => {
+            engine::server::serve(std::time::Duration::from_secs(idle_minutes * 60))?;
             Ok(0)
         }
         Cmd::Setup {

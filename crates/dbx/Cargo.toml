@@ -13,9 +13,14 @@ anyhow.workspace = true
 clap.workspace = true
 common.workspace = true
 libc = "0.2"
+postgres = "0.19"
 ratatui.workspace = true
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 serde.workspace = true
 serde_json.workspace = true
+tiny_http = "0.12"
 toml = "1.2"
 toml_edit = "0.25"
+tokio-postgres-rustls = "0.14"
 url = "2.5"
+webpki-roots = "1"
