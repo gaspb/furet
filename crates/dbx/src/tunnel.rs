@@ -7,6 +7,7 @@ use std::net::{TcpStream, ToSocketAddrs};
 use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::process::{Child, Command, ExitStatus, Stdio};
+use std::sync::atomic::{AtomicI32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -62,6 +63,7 @@ impl Tunnel {
         let log: Log = Arc::default();
         drain(child.stdout.take().unwrap(), log.clone());
         drain(child.stderr.take().unwrap(), log.clone());
+        register(child.id() as i32);
         let mut t = Tunnel { child, log };
         let start = Instant::now();
         loop {
@@ -106,6 +108,7 @@ impl Tunnel {
 impl Drop for Tunnel {
     fn drop(&mut self) {
         let pgid = self.child.id() as i32;
+        unregister(pgid);
         unsafe { libc::kill(-pgid, libc::SIGTERM) };
         for _ in 0..20 {
             if matches!(self.child.try_wait(), Ok(Some(_))) {
@@ -133,4 +136,44 @@ pub fn run_foreground(cmd: &mut Command) -> std::io::Result<ExitStatus> {
         unsafe { libc::signal(*s, old[i]) };
     }
     status
+}
+
+/// Process groups of running tunnels, so a signal that ends dbx can stop them first.
+static GROUPS: [AtomicI32; 16] = [const { AtomicI32::new(0) }; 16];
+
+fn register(pgid: i32) {
+    for slot in &GROUPS {
+        if slot
+            .compare_exchange(0, pgid, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok()
+        {
+            return;
+        }
+    }
+}
+
+fn unregister(pgid: i32) {
+    for slot in &GROUPS {
+        let _ = slot.compare_exchange(pgid, 0, Ordering::SeqCst, Ordering::SeqCst);
+    }
+}
+
+extern "C" fn stop_tunnels_and_die(sig: libc::c_int) {
+    for slot in &GROUPS {
+        let pgid = slot.load(Ordering::SeqCst);
+        if pgid > 0 {
+            unsafe { libc::kill(-pgid, libc::SIGTERM) };
+        }
+    }
+    unsafe {
+        libc::signal(sig, libc::SIG_DFL);
+        libc::raise(sig);
+    }
+}
+
+/// Ctrl-C, a closed pane or a kill stops dbx's tunnels instead of leaving them running.
+pub fn stop_tunnels_on_exit_signals() {
+    for sig in [libc::SIGINT, libc::SIGTERM, libc::SIGHUP] {
+        unsafe { libc::signal(sig, stop_tunnels_and_die as *const () as libc::sighandler_t) };
+    }
 }

@@ -129,6 +129,7 @@ enum Integration {
 }
 
 fn main() {
+    tunnel::stop_tunnels_on_exit_signals();
     match run(Cli::parse()) {
         Ok(code) => std::process::exit(code),
         Err(e) => {
@@ -353,8 +354,6 @@ fn keep_tunnel(scope: &Scope, name: &str) -> Result<i32> {
         r.host, r.port
     );
     set_title(&format!("dbx · {name} tunnel"));
-    extern "C" fn stop(_: libc::c_int) {}
-    unsafe { libc::signal(libc::SIGINT, stop as *const () as libc::sighandler_t) };
     let status = t.wait();
     eprintln!("tunnel stopped");
     Ok(status.map(|s| s.code().unwrap_or(0)).unwrap_or(0))
