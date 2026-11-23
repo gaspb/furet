@@ -16,6 +16,7 @@ dbx include <path>      also use another clone's connections
 dbx cp <name> --from <path> [--as <new>]
 dbx edit [--global]     open the connections file in $EDITOR
 dbx setup herdr         name and icon in the herdr app
+dbx serve --ensure      the engine behind the herdr explorer (see below); --stop stops it
 ```
 
 ## Connections
@@ -86,6 +87,29 @@ read-only on their own. For Claude Code, add to `~/.claude/CLAUDE.md`:
 
 ## herdr
 
-`dbx setup herdr` gives dbx panes their name and icon. The `dbx` panel in
-[herdr-mods](https://github.com/gaspb/herdr-mods) lists the focused space's connections and tunnels,
-and opens one in a split.
+`dbx setup herdr` gives dbx panes their name and icon. The `dbx` mod in
+[herdr-mods](https://github.com/gaspb/herdr-mods) is a database explorer (tree, consoles, table data
+and structure) for the space's repo, running on `dbx serve`.
+
+## Engine: `dbx serve`
+
+A local server that holds database sessions for the explorer, using the same connections as the CLI.
+`dbx serve --ensure` starts it in the background if it isn't running (one per user) and prints
+`{url, token, …}`; it stops after an hour without requests and open sessions, and closes sessions
+idle for 30 minutes. Postgres only for now.
+
+- Listens on `127.0.0.1` on a random port. Every request needs `Authorization: Bearer <token>`
+  and a `Host` of `127.0.0.1:<port>`, so web pages (including DNS rebinding) and other users can't
+  use your connections. The token is in `~/.local/state/dbx/serve.json`, readable only by you;
+  your own processes can read it, as they can read your connection files.
+- Secrets (`env`, `dotenv`, `cmd`) are read by the engine when a session opens: `{ env = … }` sees
+  the engine's environment (the herdr app's), not the terminal you typed in.
+- Read-only works as in the CLI; writes on prod need the connection's name in `confirm`.
+
+| | |
+| --- | --- |
+| `GET /connections?cwd=` | what `dbx ls --json` shows for that folder |
+| `POST /sessions` `{cwd, name, write?, confirm?}` | connect (starting the tunnel) |
+| `POST /sessions/:id/query` `{sql, cursor?, selection?, all?, limit?, offset?}` | run the statement under the cursor, the selection, or all; a lone read-only statement is paged with column types |
+| `POST /sessions/:id/cancel` · `/mode` `{write, confirm?}` · `DELETE /sessions/:id` | |
+| `GET /sessions/:id/catalog` · `/table?schema=&name=` | schemas, tables and columns; one table's columns, indexes, constraints |
