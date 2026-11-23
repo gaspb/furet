@@ -1,0 +1,21 @@
+[package]
+name = "dbx"
+version = "0.1.0"
+description = "Database connections scoped to the repo you're in: secrets by reference, kubectl tunnels, read-only remotes"
+keywords = ["postgres", "clickhouse", "cli", "tui", "database"]
+categories = ["command-line-utilities"]
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+common.workspace = true
+libc = "0.2"
+ratatui.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+toml = "1.2"
+toml_edit = "0.25"
+url = "2.5"
