@@ -4,8 +4,9 @@ pub mod pg;
 pub mod server;
 pub mod sql;
 
-use crate::config::{Kind, Scope};
+use crate::config::{Entry, Kind, Scope};
 use crate::conn;
+use crate::store;
 use crate::tunnel::Tunnel;
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -68,6 +69,14 @@ pub struct Engine {
 }
 
 #[derive(Deserialize)]
+pub struct DraftReq {
+    pub cwd: PathBuf,
+    pub draft: store::Draft,
+    /// The connection's name before this edit; absent for a new one.
+    pub previous: Option<String>,
+}
+
+#[derive(Deserialize)]
 pub struct OpenReq {
     pub cwd: PathBuf,
     pub name: String,
@@ -119,6 +128,61 @@ impl Engine {
             "file": crate::config::project_file(&scope.root),
             "connections": crate::rows(&scope),
         }))
+    }
+
+    pub fn draft(&self, cwd: &str, name: &str) -> Result<Value, Fail> {
+        let scope = Scope::load(std::path::Path::new(cwd))?;
+        let d = store::draft_of(&scope, name).map_err(|e| Fail(400, format!("{e:#}")))?;
+        Ok(serde_json::to_value(d)?)
+    }
+
+    /// Connects with a draft (tunnel included) without saving it.
+    pub fn test(&self, req: DraftReq) -> Result<Value, Fail> {
+        let scope = Scope::load(&req.cwd)?;
+        let existing = req
+            .previous
+            .as_deref()
+            .and_then(|p| scope.get(p).ok())
+            .map(|e| e.conn.clone());
+        let conn = store::conn_of(&req.draft, existing.as_ref())
+            .map_err(|e| Fail(400, format!("{e:#}")))?;
+        let entry = Entry {
+            name: req.draft.name.clone(),
+            layer: 0,
+            conn,
+        };
+        let layer = &scope.layers[0];
+        let r = conn::resolve(&entry, layer).map_err(|e| Fail(400, format!("{e:#}")))?;
+        let _tunnel = match &entry.conn.tunnel {
+            Some(cmd) => self.tunnel(cmd, &r.host, r.port, &layer.base)?,
+            None => None,
+        };
+        if r.kind == Kind::Clickhouse {
+            let up = crate::tunnel::is_up(&r.host, r.port);
+            return Ok(json!({ "ok": up, "message": if up {
+                format!("{}:{} answers (the panel can't open ClickHouse sessions yet)", r.host, r.port)
+            } else {
+                format!("nothing answers on {}:{}", r.host, r.port)
+            }}));
+        }
+        match pg::Pg::connect(&r) {
+            Ok(pg) => Ok(
+                json!({ "ok": true, "message": format!("Connected · Postgres {}", pg.server_version) }),
+            ),
+            Err(e) => Ok(json!({ "ok": false, "message": format!("{e:#}") })),
+        }
+    }
+
+    pub fn save(&self, req: DraftReq) -> Result<Value, Fail> {
+        let saved = store::save(&req.cwd, &req.draft, req.previous.as_deref())
+            .map_err(|e| Fail(400, format!("{e:#}")))?;
+        Ok(serde_json::to_value(saved)?)
+    }
+
+    pub fn remove(&self, cwd: &str, name: &str) -> Result<Value, Fail> {
+        let file = store::remove(std::path::Path::new(cwd), name)
+            .map_err(|e| Fail(400, format!("{e:#}")))?;
+        Ok(json!({ "removed": name, "file": file }))
     }
 
     pub fn open(&self, req: OpenReq) -> Result<Value, Fail> {

@@ -2,6 +2,7 @@ mod config;
 mod conn;
 mod engine;
 mod picker;
+mod store;
 mod tunnel;
 
 use anyhow::{Context, Result, bail};
@@ -98,6 +99,8 @@ enum Cmd {
         #[arg(long)]
         global: bool,
     },
+    /// Remove a connection (and its keychain password) from this repo or the global file
+    Rm { name: String },
     /// Also use another repo's connections from this one
     Include { path: PathBuf },
     /// Copy a connection from another repo into this one
@@ -198,11 +201,15 @@ fn command(cmd: Cmd, cwd: &Path) -> Result<i32> {
             tunnel,
             global,
         } => add(cwd, &name, &url, stage, tunnel, global),
+        Cmd::Rm { name } => {
+            println!("removed {name} from {}", tilde(&store::remove(cwd, &name)?));
+            Ok(0)
+        }
         Cmd::Include { path } => include(cwd, &path),
         Cmd::Cp { name, from, rename } => copy(cwd, &name, &from, rename.as_deref()),
-        Cmd::Edit { global } => edit(&target_file(cwd, global)?, global),
+        Cmd::Edit { global } => edit(&store::target_file(cwd, global)?, global),
         Cmd::Path { global } => {
-            println!("{}", target_file(cwd, global)?.display());
+            println!("{}", store::target_file(cwd, global)?.display());
             Ok(0)
         }
         Cmd::Serve { stop: true, .. } => {
@@ -544,7 +551,7 @@ fn pick(cwd: &Path) -> Result<i32> {
             picker::Action::Quit => return Ok(0),
             picker::Action::Refresh => {}
             picker::Action::Edit => {
-                edit(&target_file(cwd, false)?, false)?;
+                edit(&store::target_file(cwd, false)?, false)?;
             }
             picker::Action::Open { name, write } => {
                 let Ok(scope) = scope else { continue };
@@ -556,74 +563,6 @@ fn pick(cwd: &Path) -> Result<i32> {
     }
 }
 
-const PROJECT_TEMPLATE: &str = r#"# dbx connections for {root}
-# Kept outside the repo; its worktrees share them. Values can be read when needed:
-#   { env = "VAR" }, { dotenv = ".env", key = "VAR" } (from the current worktree), { cmd = "…" }
-#
-# include = ["~/src/other-clone"]     # also use another clone's connections
-#
-# [conn.local]
-# url = { dotenv = ".env", key = "DATABASE_URL" }
-#
-# [conn.stg]
-# url = "postgres://app@localhost:15432/app"
-# password = { cmd = "kubectl -n stg get secret pg -o jsonpath='{.data.password}' | base64 -d" }
-# tunnel = "kubectl -n stg port-forward svc/postgres 15432:5432"
-# stage = "stg"                       # anything but local/dev/test opens read-only (dbx -w to write)
-#
-# [conn.events]
-# url = "clickhouse://default@localhost:9000/events"
-# client = ["clickhouse-client", "--host", "{host}", "--port", "{port}"]   # optional
-"#;
-
-const GLOBAL_TEMPLATE: &str = r#"# dbx connections available from every repo (each repo's own win on a name clash).
-# Same format as a repo's file; `dotenv` paths start from the current worktree.
-#
-# [clients]
-# postgres = ["pgcli"]
-# clickhouse = ["clickhouse-client", "--host", "{host}", "--port", "{port}", "--user", "{user}"]
-#
-# [conn.scratch]
-# url = "postgres://postgres:postgres@localhost:5432/postgres"
-"#;
-
-fn target_file(cwd: &Path, global: bool) -> Result<PathBuf> {
-    if global {
-        let f = config::global_file();
-        std::fs::create_dir_all(f.parent().unwrap())?;
-        return Ok(f);
-    }
-    config::ensure_project_dir(&common::scope::project_root(cwd))
-}
-
-fn load_doc(file: &Path) -> Result<DocumentMut> {
-    let text = match std::fs::read_to_string(file) {
-        Ok(t) => t,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
-        Err(e) => return Err(e).with_context(|| format!("cannot read {}", file.display())),
-    };
-    text.parse()
-        .with_context(|| format!("in {}", file.display()))
-}
-
-fn template(file: &Path, global: bool) -> String {
-    if global {
-        return GLOBAL_TEMPLATE.into();
-    }
-    let root = std::fs::read_to_string(file.with_file_name(".root")).unwrap_or_default();
-    PROJECT_TEMPLATE.replace("{root}", &tilde(Path::new(root.trim())))
-}
-
-fn save_doc(file: &Path, doc: &DocumentMut, global: bool) -> Result<()> {
-    let mut text = doc.to_string();
-    if !file.exists() {
-        text = format!("{}\n{text}", template(file, global));
-    }
-    toml::from_str::<File>(&text)
-        .with_context(|| format!("would make {} invalid", file.display()))?;
-    common::herdr::write_atomic(file, &text)
-}
-
 fn add(
     cwd: &Path,
     name: &str,
@@ -632,36 +571,18 @@ fn add(
     tunnel: Option<String>,
     global: bool,
 ) -> Result<i32> {
-    let parsed = url::Url::parse(url).context("invalid url")?;
-    if !matches!(parsed.scheme(), "postgres" | "postgresql" | "clickhouse") {
-        bail!("url should start with postgres:// or clickhouse://");
-    }
-    let file = target_file(cwd, global)?;
-    let mut doc = load_doc(&file)?;
-    let conns = doc
-        .entry("conn")
-        .or_insert(toml_edit::table())
-        .as_table_mut()
-        .context("`conn` is not a table")?;
-    conns.set_implicit(true);
-    if conns.contains_key(name) {
-        bail!("{name} already exists in {}", file.display());
-    }
-    let mut t = toml_edit::Table::new();
-    t["url"] = toml_edit::value(url);
-    if let Some(s) = stage {
-        t["stage"] = toml_edit::value(s);
-    }
-    if let Some(tn) = tunnel {
-        t["tunnel"] = toml_edit::value(tn);
-    }
-    conns.insert(name, toml_edit::Item::Table(t));
-    save_doc(&file, &doc, global)?;
-    println!("added {name} to {}", tilde(&file));
-    if parsed.password().is_some() {
-        eprintln!(
-            "note: the password is stored in that file as is; `password = {{ cmd = \"…\" }}` or `{{ env = \"…\" }}` keeps it out"
-        );
+    let draft = store::Draft {
+        name: name.into(),
+        url: url.into(),
+        stage,
+        tunnel,
+        global,
+        ..Default::default()
+    };
+    let saved = store::save(cwd, &draft, None)?;
+    println!("added {name} to {}", tilde(&saved.file));
+    for n in saved.notes {
+        println!("{n}");
     }
     Ok(0)
 }
@@ -672,8 +593,8 @@ fn include(cwd: &Path, path: &Path) -> Result<i32> {
     if other == own {
         bail!("that is this repo");
     }
-    let file = target_file(cwd, false)?;
-    let mut doc = load_doc(&file)?;
+    let file = store::target_file(cwd, false)?;
+    let mut doc = store::load_doc(&file)?;
     let list = doc
         .entry("include")
         .or_insert(toml_edit::value(toml_edit::Array::new()));
@@ -684,7 +605,7 @@ fn include(cwd: &Path, path: &Path) -> Result<i32> {
         return Ok(0);
     }
     arr.push(entry.as_str());
-    save_doc(&file, &doc, false)?;
+    store::save_doc(&file, &doc, false)?;
     let n = File::read(&config::project_file(&other))?.conn.len();
     println!("{} now includes {entry} ({n} connections)", tilde(&own));
     Ok(0)
@@ -697,8 +618,8 @@ fn copy(cwd: &Path, name: &str, from: &Path, rename: Option<&str>) -> Result<i32
     let src: DocumentMut = std::fs::read_to_string(src_file)?.parse()?;
     let item = src["conn"][name].clone();
     let new = rename.unwrap_or(name);
-    let file = target_file(cwd, false)?;
-    let mut doc = load_doc(&file)?;
+    let file = store::target_file(cwd, false)?;
+    let mut doc = store::load_doc(&file)?;
     let conns = doc
         .entry("conn")
         .or_insert(toml_edit::table())
@@ -709,14 +630,14 @@ fn copy(cwd: &Path, name: &str, from: &Path, rename: Option<&str>) -> Result<i32
         bail!("{new} already exists in {}", file.display());
     }
     conns.insert(new, item);
-    save_doc(&file, &doc, false)?;
+    store::save_doc(&file, &doc, false)?;
     println!("copied {name} from {} as {new}", tilde(src_file));
     Ok(0)
 }
 
 fn edit(file: &Path, global: bool) -> Result<i32> {
     if !file.exists() {
-        common::herdr::write_atomic(file, &template(file, global))?;
+        store::write_private(file, &store::template(file, global))?;
     }
     let editor = std::env::var("VISUAL")
         .or_else(|_| std::env::var("EDITOR"))

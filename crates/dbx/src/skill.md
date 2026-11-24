@@ -19,6 +19,7 @@ Rules:
   `-w` allows writes; on prod it asks the user to type the name, so you can't use it there. Ask the
   user before writing anywhere but local.
 - Don't run `dbx` with no arguments or `dbx <name>`: both open interactive clients.
-- To add a connection: `dbx add <name> <url> [--stage stg] [--tunnel '<cmd>']`. Prefer secrets by
+- To add a connection: `dbx add <name> <url> [--stage stg] [--tunnel '<cmd>']` (a password in the URL goes to the
+  keychain, not the file). Prefer secrets by
   reference (`password = { cmd = "…" }`, `{ env = "VAR" }`, `{ dotenv = ".env", key = "VAR" }`) in the
   file shown by `dbx path`, rather than a password in the URL.
