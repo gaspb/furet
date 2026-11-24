@@ -25,6 +25,7 @@ pub fn read_value(v: &Value, base: &Path) -> Result<String> {
     match v {
         Value::Plain(s) => Ok(s.clone()),
         Value::Env { env } => std::env::var(env).with_context(|| format!("${env} is not set")),
+        Value::Keychain { keychain } => crate::store::keychain_get(keychain),
         Value::Dotenv { dotenv, key } => {
             let path = common::scope::expand(dotenv, base);
             let text = fs::read_to_string(&path)

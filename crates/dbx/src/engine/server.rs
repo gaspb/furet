@@ -303,6 +303,24 @@ fn respond(engine: &Engine, info: &Info, mut req: Request) -> bool {
                 Ok(json!({ "stopping": true }))
             }
             (Method::Get, ["connections"]) => param("cwd").and_then(|cwd| engine.connections(&cwd)),
+            (Method::Get, ["connections", "draft"]) => {
+                param("cwd").and_then(|c| param("name").and_then(|n| engine.draft(&c, &n)))
+            }
+            (Method::Post, ["connections", what @ ("test" | "save")]) => parse(&body)
+                .and_then(|v| {
+                    serde_json::from_value::<super::DraftReq>(v)
+                        .map_err(|e| Fail(400, e.to_string()))
+                })
+                .and_then(|r| {
+                    if *what == "test" {
+                        engine.test(r)
+                    } else {
+                        engine.save(r)
+                    }
+                }),
+            (Method::Delete, ["connections"]) => {
+                param("cwd").and_then(|c| param("name").and_then(|n| engine.remove(&c, &n)))
+            }
             (Method::Get, ["sessions"]) => Ok(engine.list()),
             (Method::Post, ["sessions"]) => parse(&body)
                 .and_then(|v| {
@@ -321,6 +339,12 @@ fn respond(engine: &Engine, info: &Info, mut req: Request) -> bool {
                     serde_json::from_value::<ModeReq>(v).map_err(|e| Fail(400, e.to_string()))
                 })
                 .and_then(|r| engine.mode(id, r)),
+            (Method::Post, ["sessions", id, "apply"]) => parse(&body)
+                .and_then(|v| {
+                    serde_json::from_value::<super::ApplyReq>(v)
+                        .map_err(|e| Fail(400, e.to_string()))
+                })
+                .and_then(|r| engine.apply(id, r)),
             (Method::Get, ["sessions", id, "catalog"]) => engine.catalog(id),
             (Method::Get, ["sessions", id, "table"]) => {
                 param("schema").and_then(|s| param("name").and_then(|n| engine.table(id, &s, &n)))

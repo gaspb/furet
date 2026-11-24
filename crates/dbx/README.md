@@ -12,6 +12,7 @@ dbx run <name> -- cmd   run cmd with PG*/CLICKHOUSE_* and DATABASE_URL set, tunn
 dbx url <name>          the URL, password included        dbx env <name>   as export lines
 dbx tunnel <name>       keep a tunnel up until Ctrl-C
 dbx add <name> <url> [--stage stg] [--tunnel '<cmd>'] [--global]
+dbx rm <name>           remove a connection (and its keychain password)
 dbx include <path>      also use another clone's connections
 dbx cp <name> --from <path> [--as <new>]
 dbx edit [--global]     open the connections file in $EDITOR
@@ -47,8 +48,11 @@ tunnel = "kubectl -n prod port-forward svc/clickhouse 19000:9000"
 stage = "prod"
 ```
 
-- Any of `url`, `host`, `user`, `password`, `database` can be a string, `{ env = "VAR" }`,
-  `{ dotenv = "path", key = "VAR" }` or `{ cmd = "shell command" }`. Fields override what the URL says.
+- Any of `url`, `host`, `user`, `password`, `database` can be a string, `{ keychain = "…" }` (the OS keychain),
+  `{ env = "VAR" }`, `{ dotenv = "path", key = "VAR" }` or `{ cmd = "shell command" }`.
+- Passwords never need to be in the file: a URL given to `dbx add` (or the panel's form) with a password in it is
+  saved without it, and the password goes to the OS keychain (macOS Keychain, or the Secret Service on Linux:
+  GNOME Keyring, KWallet, KeePassXC). The files and their folders are readable only by you. Fields override what the URL says.
   Relative paths and commands start from the current worktree (from the included repo, for its connections).
 - `tunnel` runs before connecting, unless the port already answers (a tunnel from another pane is reused),
   and is stopped when the client exits. In the picker it stays up until you quit.

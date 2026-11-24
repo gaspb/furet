@@ -18,6 +18,7 @@ pub enum Value {
     Env { env: String },
     Dotenv { dotenv: String, key: String },
     Cmd { cmd: String },
+    Keychain { keychain: String },
 }
 
 impl Value {
@@ -212,6 +213,7 @@ impl Scope {
         };
         let mut seen = HashSet::new();
         s.add_project(&root, worktree.clone(), Origin::Project, &mut seen)?;
+        crate::store::tighten(&global_file());
         let global = File::read(&global_file())?;
         s.clients = global.clients.clone();
         s.add_layer(
@@ -237,6 +239,7 @@ impl Scope {
             return Ok(());
         }
         let file = project_file(root);
+        crate::store::tighten(&file);
         let content = File::read(&file)?;
         let includes: Vec<PathBuf> = content
             .include
