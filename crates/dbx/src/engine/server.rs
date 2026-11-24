@@ -339,6 +339,12 @@ fn respond(engine: &Engine, info: &Info, mut req: Request) -> bool {
                     serde_json::from_value::<ModeReq>(v).map_err(|e| Fail(400, e.to_string()))
                 })
                 .and_then(|r| engine.mode(id, r)),
+            (Method::Post, ["sessions", id, "apply"]) => parse(&body)
+                .and_then(|v| {
+                    serde_json::from_value::<super::ApplyReq>(v)
+                        .map_err(|e| Fail(400, e.to_string()))
+                })
+                .and_then(|r| engine.apply(id, r)),
             (Method::Get, ["sessions", id, "catalog"]) => engine.catalog(id),
             (Method::Get, ["sessions", id, "table"]) => {
                 param("schema").and_then(|s| param("name").and_then(|n| engine.table(id, &s, &n)))

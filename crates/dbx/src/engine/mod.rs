@@ -101,6 +101,11 @@ pub struct QueryReq {
 }
 
 #[derive(Deserialize)]
+pub struct ApplyReq {
+    pub statements: Vec<String>,
+}
+
+#[derive(Deserialize)]
 pub struct ModeReq {
     pub write: bool,
     pub confirm: Option<String>,
@@ -348,6 +353,19 @@ impl Engine {
     pub fn catalog(&self, id: &str) -> Result<Value, Fail> {
         let s = self.session(id)?;
         Ok(s.pg.lock().unwrap().catalog()?)
+    }
+
+    pub fn apply(&self, id: &str, req: ApplyReq) -> Result<Value, Fail> {
+        let s = self.session(id)?;
+        if req.statements.is_empty() {
+            return fail(400, "nothing to apply");
+        }
+        Ok(match s.pg.lock().unwrap().apply(&req.statements) {
+            Ok(n) => json!({ "applied": n }),
+            Err((index, message)) => {
+                json!({ "applied": 0, "error": { "index": index, "message": message } })
+            }
+        })
     }
 
     pub fn table(&self, id: &str, schema: &str, name: &str) -> Result<Value, Fail> {

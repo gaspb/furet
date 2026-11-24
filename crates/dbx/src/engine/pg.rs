@@ -177,6 +177,28 @@ impl Pg {
         self.client.is_closed()
     }
 
+    /// Runs `statements` in one transaction, each expected to change exactly one row; anything
+    /// else rolls the whole batch back. Returns the index and message of the one that failed.
+    pub fn apply(&mut self, statements: &[String]) -> std::result::Result<usize, (usize, String)> {
+        let mut tx = self.client.transaction().map_err(|e| (0, describe(&e)))?;
+        for (i, stmt) in statements.iter().enumerate() {
+            match tx.execute(stmt.as_str(), &[]) {
+                Ok(1) => {}
+                Ok(0) => {
+                    return Err((
+                        i,
+                        "the row changed or is gone since it was loaded; nothing was applied"
+                            .into(),
+                    ));
+                }
+                Ok(n) => return Err((i, format!("it would change {n} rows; nothing was applied"))),
+                Err(e) => return Err((i, format!("{}; nothing was applied", describe(&e)))),
+            }
+        }
+        tx.commit().map_err(|e| (statements.len(), describe(&e)))?;
+        Ok(statements.len())
+    }
+
     pub fn set_readonly(&mut self, on: bool) -> Result<()> {
         let v = if on { "on" } else { "off" };
         self.client
@@ -397,7 +419,20 @@ impl Pg {
                 serde_json::json!({ "name": r.get::<_, String>(0), "kind": kind, "definition": r.get::<_, String>(2) })
             })
             .collect();
+        let primary_key: Vec<String> = self
+            .client
+            .query(
+                "select a.attname::text from pg_index i
+                 join lateral unnest(i.indkey) with ordinality k(attnum, n) on true
+                 join pg_attribute a on a.attrelid = i.indrelid and a.attnum = k.attnum
+                 where i.indrelid = $1 and i.indisprimary order by k.n",
+                &[&oid],
+            )?
+            .iter()
+            .map(|r| r.get(0))
+            .collect();
         Ok(serde_json::json!({
+            "primary_key": primary_key,
             "schema": schema, "name": name, "kind": head.get::<_, String>(1),
             "rows": head.get::<_, i64>(2), "bytes": head.get::<_, i64>(3),
             "comment": head.get::<_, Option<String>>(4), "view_definition": head.get::<_, Option<String>>(5),
