@@ -11,6 +11,7 @@ import { complete, lineCol, quoteIdent, csv, json, literal } from "./sql.js";
 import { openForm, formBody, removeConnection, editFile } from "./form.js";
 import { openMenu, menuLayer, menuKey } from "./menu.js";
 import { helpBody } from "./help.js";
+import { peek, cellRef, closePeek, peekPanel } from "./peek.js";
 import * as lineOps from "./lines.js";
 
 const LIMITS = [100, 500, 2000];
@@ -68,6 +69,10 @@ export default class Dbx extends View {
         line(`${MOD}-c`, "copyLine"), line(`${MOD}-x`, "cutLine"), line("ctrl-d", "duplicate"),
         line("alt-shift-up", "moveUp"), line("alt-shift-down", "moveDown"), line("ctrl-/", "toggleComment"),
         { keystroke: "down", action: "dbx_filter_down", context: "DbxFilter > Input" },
+        ...["tab", "right"].flatMap((k) => [
+          { keystroke: k, action: `dbx_fill_where_${k}`, context: "DbxWhere > Input" },
+          { keystroke: k, action: `dbx_fill_order_${k}`, context: "DbxOrder > Input" },
+        ]),
         { keystroke: "escape", action: "dbx_filter_clear", context: "DbxFilter > Input" },
         ...["ctrl-enter", "cmd-enter"].map((k) => ({ keystroke: k, action: "dbx_run", context: inConsole })),
         ...["ctrl-shift-enter", "cmd-shift-enter"].map((k) => ({ keystroke: k, action: "dbx_run_all", context: inConsole })),
@@ -234,17 +239,28 @@ export default class Dbx extends View {
     this.newConsole(name, cx, `select * from ${quoteIdent(schema)}.${quoteIdent(table)} limit 100;`);
   }
 
-  openTable(name, schema, table, kind, cx) {
+  /** A table view; `where`, when given, filters it (an open one is filtered again). */
+  openTable(name, schema, table, kind, cx, where) {
     const existing = this.tabs.find((x) => x.kind === "table" && x.conn === name && x.schema === schema && x.table === table);
-    if (existing) { this.active = existing.id; cx.notify(); return; }
+    if (existing) {
+      this.active = existing.id;
+      if (where !== undefined && !changes(existing)) { existing.where = where; existing.whereInput.set_value(where); existing.offset = 0; this.loadTable(existing, cx); }
+      cx.notify();
+      return;
+    }
     const tab = this.addTab({ kind: "table", conn: name, schema, table, relkind: kind, title: table, view: "data",
       where: "", order: "", offset: 0, limit: 200, results: null, info: null, error: null, running: false, sel: null, sort: null,
       pending: new Map(), deleted: new Set(), editing: null }, cx);
     tab.scroll = ScrollHandle.new();
     tab.editInput = InputState.new({ placeholder: "value" });
     tab.editInput.on("submit", (_e, cx) => commitEdit(tab, tab.editInput.value(), cx));
-    tab.whereInput = InputState.new({ placeholder: "status = 'paid'  (Enter)" });
-    tab.orderInput = InputState.new({ placeholder: "id desc" });
+    const cols = this.source(name).catalog?.tables.find((y) => y.schema === schema && y.name === table)?.columns ?? [];
+    const first = cols[0], quoted = first ? quoteIdent(first.name) : "id";
+    const sample = first && !/int|numeric|float|double|real|serial|UInt|Int|Float|Decimal/.test(first.type ?? "") ? "''" : "1";
+    tab.placeholders = { where: `${quoted} = ${sample}`, order: `${quoted} desc` };
+    tab.whereInput = InputState.new({ placeholder: tab.placeholders.where });
+    tab.orderInput = InputState.new({ placeholder: tab.placeholders.order });
+    if (where) { tab.where = where; tab.whereInput.set_value(where); }
     const apply = (_e, cx) => { tab.where = tab.whereInput.value(); tab.order = tab.orderInput.value(); tab.sort = null; tab.offset = 0; this.loadTable(tab, cx); };
     tab.whereInput.on("submit", apply);
     tab.orderInput.on("submit", apply);
@@ -301,7 +317,13 @@ export default class Dbx extends View {
       const set = tab.results?.[tab.picked ?? 0], key = `${tab.sel.row}:${tab.sel.col}`;
       const v = tab.pending?.has(key) ? tab.pending.get(key) : set?.rows[tab.sel.row]?.[tab.sel.col];
       if (tab.sel.col !== null && v !== undefined) this.copy(v ?? "", "the cell", cx);
-    } else if (k === "escape") this.focusZone(tab.kind === "console" ? "editor" : "where", cx);
+    } else if (k === "space") {
+      const r = cellRef(tab);
+      if (tab.peek?.length) closePeek(tab, cx);
+      else if (r) peek(this, tab, r.refs, r.value, cx, { fresh: true });
+      else this.flash("Space previews a foreign key's row: this column isn't one", cx);
+    } else if (k === "escape" && tab.peek?.length) closePeek(tab, cx);
+    else if (k === "escape") this.focusZone(tab.kind === "console" ? "editor" : "where", cx);
     else if (["up", "down", "left", "right"].includes(k)) {
       const [dr, dc] = { up: [-1, 0], down: [1, 0], left: [0, -1], right: [0, 1] }[k];
       this.moveSel(tab, dr, dc, cx);
@@ -310,6 +332,7 @@ export default class Dbx extends View {
   }
 
   pick(tab, row, col, double, cx) {
+    if (tab.sel?.row !== row) tab.peek = null;
     tab.sel = { row, col };
     this.gridHandle.focus();
     this.zone = "grid";
@@ -766,6 +789,28 @@ export default class Dbx extends View {
     return [];
   }
 
+  /**
+   * Tab or → in a table view's WHERE/ORDER BY: an empty field takes its placeholder (the value
+   * part selected, to type over); otherwise Tab moves on and → moves the cursor.
+   */
+  fillField(which, key, cx) {
+    const tab = this.activeTab();
+    if (tab?.kind !== "table") return;
+    const input = which === "where" ? tab.whereInput : tab.orderInput;
+    const text = input.value(), sel = input.selected_range();
+    if (!text) {
+      const fill = tab.placeholders[which];
+      input.set_value(fill);
+      const eq = fill.indexOf("= ");
+      input.set_selected_range(eq >= 0 ? { start: eq + 2, end: fill.length } : { start: fill.length, end: fill.length });
+    } else if (key === "right") {
+      const at = sel.start === sel.end ? Math.min(text.length, sel.end + 1) : Math.max(sel.start, sel.end);
+      input.set_selected_range({ start: at, end: at });
+    } else if (which === "where") tab.orderInput.focus();
+    else this.focusZone("grid", cx);
+    cx.notify();
+  }
+
   /** A right-click on a result cell. */
   cellMenu(tab, row, col, e, cx) {
     const set = tab.results?.[tab.picked ?? 0];
@@ -781,7 +826,11 @@ export default class Dbx extends View {
       tab.offset = 0;
       this.loadTable(tab, cx);
     };
+    const fk = set.columns[col].refs;
     openMenu(this, e, [
+      fk && v !== null && { label: `Preview the ${fk.table} row`, hint: "Space", run: (cx) => peek(this, tab, fk, v, cx, { fresh: true }) },
+      fk && v !== null && { label: `Open ${fk.table} at this row`, run: (cx) => this.openTable(tab.conn, fk.schema, fk.table, "table", cx, `${quoteIdent(fk.column)} = ${literal(v)}`) },
+      fk && v !== null && "-",
       { label: "Copy value", hint: "⌘C", run: (cx) => this.copy(v ?? "", "the value", cx) },
       { label: "Copy column name", run: (cx) => this.copy(name, "the column name", cx) },
       { label: "Copy row as JSON", run: (cx) => this.copy(JSON.stringify(record, null, 2), "the row as JSON", cx) },
@@ -958,14 +1007,16 @@ export default class Dbx extends View {
       .when(set.columns.length > 0, (e) => e.child(grid(`dbx-grid-${tab.id}`, set, {
         t, font, offset, sel: tab.sel, sort: tab.sort, scroll: tab.scroll, zoom: settings().zoom ?? 1,
         order: tab.kind === "console" ? displayOrder(set, tab.sort) : undefined,
-        pending: tab.pending, deleted: tab.deleted,
+        pending: tab.pending, deleted: tab.deleted, pk: tab.info?.primary_key,
         onSort: (col, cx) => this.sortBy(tab, col, cx),
         onPick: (row, col, double, cx) => this.pick(tab, row, col, double, cx),
         onMenu: (row, col, e, cx) => this.cellMenu(tab, row, col, e, cx),
         onHeaderMenu: (col, e, cx) => this.headerMenu(tab, col, e, cx),
         focus: this.gridHandle, onKey: (e, cx) => this.gridKey(tab, e, cx),
       })))
-      .when(Boolean(tab.sel) && Boolean(set.rows[tab.sel?.row]), (e) => e.child(record(set, tab.sel.row, { t, font, pending: tab.pending, onCopy: (v, cx) => this.copy(v, "value", cx) })))
+      .when(Boolean(tab.peek?.length), (e) => e.child(peekPanel(this, tab, t, font)))
+      .when(!tab.peek?.length && Boolean(tab.sel) && Boolean(set.rows[tab.sel?.row]), (e) => e.child(record(set, tab.sel.row, { t, font, pending: tab.pending,
+        onCopy: (v, cx) => this.copy(v, "value", cx), onRef: (refs, v, cx) => peek(this, tab, refs, v, cx, { fresh: true }) })))
       .child(h_flex().h(32).flex_none().px(10).gap(8).items_center().border_t(1).border_color(t.border).text_size(11.5)
         .child(div().text_color(t.muted).child(status))
         .child(div().text_color(t.dim).child(`${tab.elapsed ?? 0} ms`))
@@ -1084,8 +1135,8 @@ export default class Dbx extends View {
         .child(this.button(`dbx-reload-${tab.id}`, "↻", (cx) => this.loadTable(tab, cx), { t })))
       .when(tab.view === "data", (e) => e
         .child(h_flex().h(40).flex_none().px(10).gap(8).items_center().border_b(1).border_color(t.border)
-          .child(div().text_size(11).text_color(t.dim).child("WHERE")).child(field(tab.whereInput, "fill"))
-          .child(div().text_size(11).text_color(t.dim).child("ORDER BY")).child(field(tab.orderInput, 170)))
+          .child(div().text_size(11).text_color(t.dim).child("WHERE")).child(field(tab.whereInput, "fill").key_context("DbxWhere"))
+          .child(div().text_size(11).text_color(t.dim).child("ORDER BY")).child(field(tab.orderInput, 170).key_context("DbxOrder")))
         .when(Boolean(tab.confirming), (e) => e.child(h_flex().h(40).flex_none().px(10).gap(8).items_center().bg(tint(t.ansi1, "14")).border_b(1).border_color(t.border)
           .child(div().text_size(12).text_color(t.ansi1).child(`${tab.conn} is prod. Type its name and Enter to allow writes:`))
           .child(h_flex().h(28).w(180).px(8).items_center().rounded(6).border_1().border_color(t.ansi1).child(Input.new(this.confirmInput).flex_1().h_full().text_size(12)))
@@ -1124,6 +1175,10 @@ export default class Dbx extends View {
       .on_action("dbx_line_moveDown", (_e, cx) => this.lineCommand("moveLines", cx, 1))
       .on_action("dbx_line_toggleComment", (_e, cx) => this.lineCommand("toggleComment", cx))
       .on_action("dbx_filter_down", (_e, cx) => this.treeFromFilter(false, cx))
+      .on_action("dbx_fill_where_tab", (_e, cx) => this.fillField("where", "tab", cx))
+      .on_action("dbx_fill_where_right", (_e, cx) => this.fillField("where", "right", cx))
+      .on_action("dbx_fill_order_tab", (_e, cx) => this.fillField("order", "tab", cx))
+      .on_action("dbx_fill_order_right", (_e, cx) => this.fillField("order", "right", cx))
       .on_action("dbx_filter_clear", (_e, cx) => { this.filterInput.set_value(""); this.filter = ""; cx.notify(); })
       .on_mouse_down("right", (e) => {
         if (e.local_position && e.bounds) this.origin = { x: e.position.x - e.local_position.x, y: e.position.y - e.local_position.y, width: e.bounds.width, height: e.bounds.height };

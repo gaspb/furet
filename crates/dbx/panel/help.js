@@ -36,8 +36,14 @@ export const KEYS = [
     ["↑ ↓ ← →", "move the selected cell"],
     ["⌘ C", "copy the cell"],
     ["Enter · Delete", "edit the cell · mark the row for deletion (tables with a primary key)"],
+    ["Space", "preview the row a foreign key points at (again from there: nested) · Esc closes"],
     ["Esc", "back to the editor"],
     ["⇧ Enter · right-click", "copy as JSON or CSV, filter by the value, set NULL…"],
+  ]],
+  ["Table view", [
+    ["Tab · →", "in an empty WHERE or ORDER BY: take the example (its value selected, to type over)"],
+    ["Tab", "from WHERE to ORDER BY to the rows"],
+    ["Enter", "apply WHERE and ORDER BY"],
   ]],
   ["Panel", [
     ["Ctrl+` · Ctrl+⇧`", "move between tree, editor and results (or F6 · ⇧ F6)"],

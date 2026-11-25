@@ -19,6 +19,7 @@ pub const PANEL: Mod = Mod {
         "help.js",
         "lines.js",
         "menu.js",
+        "peek.js",
         "sql.js",
         "database.svg",
         "icons/postgres.svg",
