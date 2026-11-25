@@ -392,6 +392,23 @@ fn respond(engine: &Engine, info: &Info, mut req: Request) -> bool {
                         engine.save(r)
                     }
                 }),
+            (Method::Get, ["history"]) => param("cwd").and_then(|c| {
+                let limit = params
+                    .get("limit")
+                    .and_then(|l| l.parse().ok())
+                    .unwrap_or(500);
+                engine.history(&c, params.get("name").map(String::as_str), limit)
+            }),
+            (Method::Get, ["queries"]) => param("cwd").and_then(|c| engine.queries(&c)),
+            (Method::Post, ["queries"]) => parse(&body)
+                .and_then(|v| {
+                    serde_json::from_value::<super::SaveQueryReq>(v)
+                        .map_err(|e| Fail(400, e.to_string()))
+                })
+                .and_then(|q| engine.save_query(q)),
+            (Method::Delete, ["queries"]) => {
+                param("cwd").and_then(|c| param("name").and_then(|n| engine.remove_query(&c, &n)))
+            }
             (Method::Delete, ["connections"]) => {
                 param("cwd").and_then(|c| param("name").and_then(|n| engine.remove(&c, &n)))
             }

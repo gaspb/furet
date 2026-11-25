@@ -13,6 +13,8 @@ import { openMenu, menuLayer, menuKey } from "./menu.js";
 import { helpBody } from "./help.js";
 import { go, back, resetTrail, cellTarget, selected, prefetch, cellSummary, trailBar, stepLabel } from "./nav.js";
 import { inspector } from "./inspector.js";
+import { openFinder, closeFinder, finderKey, finderPanel, openSave, submitSave, saveBar } from "./finder.js";
+import { openAsk, closeAsk, sendAsk, askBar } from "./ask.js";
 import * as lineOps from "./lines.js";
 
 const LIMITS = [100, 500, 2000];
@@ -51,6 +53,12 @@ export default class Dbx extends View {
     this.filterInput = InputState.new({ placeholder: "Filter tables…" });
     this.filterInput.on("change", (_e, cx) => { this.filter = this.filterInput.value().toLowerCase(); cx.notify(); });
     this.filterInput.on("submit", (_e, cx) => this.treeFromFilter(true, cx));
+    this.findInput = InputState.new({ placeholder: "Search saved queries and history…" });
+    this.findInput.on("change", (_e, cx) => { const t = this.activeTab(); if (t?.find) t.find.at = 0; cx.notify(); });
+    this.saveInput = InputState.new({ placeholder: "e.g. stuck-invoices" });
+    this.saveInput.on("submit", (_e, cx) => { const t = this.activeTab(); if (t) submitSave(this, t, cx); });
+    this.askInput = InputState.new({ placeholder: "Your question (the SQL, error and tables go along)" });
+    this.askInput.on("submit", (_e, cx) => { const t = this.activeTab(); if (t?.ask) sendAsk(this, t, cx); });
     this.confirmInput = InputState.new({ placeholder: "Type the connection name" });
     this.confirmInput.on("submit", (_e, cx) => this.confirmWrite(cx));
     // In the editor's own context, so they win over its Tab (indent) and Enter (newline).
@@ -66,6 +74,13 @@ export default class Dbx extends View {
         { keystroke: "pagedown", action: "dbx_next_page", context: completing },
         { keystroke: "pageup", action: "dbx_prev_page", context: completing },
         ...["ctrl-space", "cmd-space"].map((k) => ({ keystroke: k, action: "dbx_complete", context: inConsole })),
+        { keystroke: "ctrl-r", action: "dbx_find", context: inConsole },
+        { keystroke: `${MOD}-s`, action: "dbx_save", context: inConsole },
+        ...["up", "down", "tab", "escape", "enter"].map((k) => ({ keystroke: k, action: `dbx_find_${k}`, context: "DbxFind > Input" })),
+        ...[`${MOD}-enter`, "ctrl-enter"].map((k) => ({ keystroke: k, action: "dbx_find_run", context: "DbxFind > Input" })),
+        { keystroke: "escape", action: "dbx_save_cancel", context: "DbxSave > Input" },
+        { keystroke: "escape", action: "dbx_ask_cancel", context: "DbxAsk > Input" },
+        { keystroke: "tab", action: "dbx_ask_next", context: "DbxAsk > Input" },
         // Free in herdr on both platforms (its Alt+↑↓, Cmd+D, Cmd+/ and tab keys stay its own).
         line(`${MOD}-c`, "copyLine"), line(`${MOD}-x`, "cutLine"), line("ctrl-d", "duplicate"),
         line("alt-shift-up", "moveUp"), line("alt-shift-down", "moveDown"), line("ctrl-/", "toggleComment"),
@@ -888,6 +903,10 @@ export default class Dbx extends View {
       { label: "Delete the line", run: (cx) => this.lineCommand("deleteLine", cx) },
       "-",
       { label: "Suggestions", hint: "Ctrl+Space", run: (cx) => { this.suggest(tab, cx, true); tab.editor.focus(); } },
+      "-",
+      { label: "Find a query…", hint: "Ctrl+R", run: (cx) => openFinder(this, tab, cx) },
+      { label: "Save the statement…", hint: "⌘S", run: (cx) => openSave(this, tab, cx) },
+      { label: "Ask an agent about it…", run: (cx) => openAsk(this, tab, tab.error ? "error" : "statement", cx) },
     ], cx);
   }
 
@@ -992,13 +1011,15 @@ export default class Dbx extends View {
         .on_click((_e, cx) => this.newConsole(this.current, cx)).child(this.current ? `+ ${this.current} console` : "+ console"));
   }
 
-  errorBox(err, text, t) {
+  errorBox(err, text, t, tab) {
     const where = err.position !== undefined && err.position !== null && text ? lineCol(text, err.position) : null;
     return v_flex().m(8).p(10).gap(4).rounded(8).border_1().border_color(tint(t.ansi1, "88")).bg(tint(t.ansi1, "14")).text_size(12)
       .child(div().text_color(t.ansi1).font_semibold().child(err.message + (where ? `  (line ${where.line}, column ${where.col})` : "")))
       .when(Boolean(err.detail), (e) => e.child(div().text_color(t.foreground).child(err.detail)))
       .when(Boolean(err.hint), (e) => e.child(div().text_color(t.muted).child(`Hint: ${err.hint}`)))
-      .when(Boolean(err.closed), (e) => e.child(div().text_color(t.muted).child("The connection was lost; the next run reconnects.")));
+      .when(Boolean(err.closed), (e) => e.child(div().text_color(t.muted).child("The connection was lost; the next run reconnects.")))
+      .when(Boolean(tab), (e) => e.child(h_flex().pt(4).child(this.button(`dbx-ask-error-${tab.id}`, "Ask an agent to fix it",
+        (cx) => openAsk(this, tab, "error", cx), { t }))));
   }
 
   results(tab, t, text) {
@@ -1006,7 +1027,7 @@ export default class Dbx extends View {
     const sets = tab.results ?? [];
     const set = sets[tab.picked ?? 0];
     const body = v_flex().flex_1().min_h(0);
-    if (tab.error) return body.child(this.errorBox(tab.error, text, t));
+    if (tab.error) return body.child(this.errorBox(tab.error, text, t, tab));
     if (!set) return body.child(div().p(12).text_size(12).text_color(t.dim).child(tab.running ? "Running…" : tab.kind === "console" ? "⌘/Ctrl+Enter runs the statement under the cursor, ⇧ runs everything." : ""));
     const rowsShown = set.rows.length, offset = tab.offset ?? 0;
     const status = set.columns.length
@@ -1058,7 +1079,8 @@ export default class Dbx extends View {
           .child(this.button(`dbx-next-${tab.id}`, "Next ›", (cx) => this.page(tab, 1, cx), { t, disabled: !set.more || tab.running })))
         .when(set.columns.length > 0, (e) => e
           .child(this.button(`dbx-csv-${tab.id}`, "CSV", (cx) => this.copy(csv(set.columns, set.rows), `${rowsShown} rows as CSV`, cx), { t }))
-          .child(this.button(`dbx-json-${tab.id}`, "JSON", (cx) => this.copy(json(set.columns, set.rows), `${rowsShown} rows as JSON`, cx), { t })));
+          .child(this.button(`dbx-json-${tab.id}`, "JSON", (cx) => this.copy(json(set.columns, set.rows), `${rowsShown} rows as JSON`, cx), { t }))
+          .child(this.button(`dbx-ask-rows-${tab.id}`, "Ask agent", (cx) => openAsk(this, tab, tab.kind === "table" && !tab.step ? "table" : "result", cx), { t })));
   }
 
   /** The rows pointing at the selected row, as a menu (`r`). */
@@ -1090,6 +1112,8 @@ export default class Dbx extends View {
     const toolbar = h_flex().h(40).flex_none().px(8).gap(6).items_center().border_b(1).border_color(t.border)
       .child(this.button(`dbx-run-${tab.id}`, tab.running ? "Running…" : "▶ Run", (cx) => this.run(tab, false, cx), { t, primary: true, disabled: tab.running || (!s && !tab.disconnected) }))
       .child(this.button(`dbx-runall-${tab.id}`, "Run all", (cx) => this.run(tab, true, cx), { t, disabled: tab.running || (!s && !tab.disconnected) }))
+      .child(this.button(`dbx-queries-${tab.id}`, "↺ Queries", (cx) => openFinder(this, tab, cx), { t }))
+      .child(this.button(`dbx-ask-${tab.id}`, "Ask agent", (cx) => openAsk(this, tab, tab.error ? "error" : "statement", cx), { t }))
       .when(tab.running, (e) => e.child(this.button(`dbx-cancel-${tab.id}`, "■ Cancel", (cx) => this.cancel(tab, cx), { t, color: t.ansi1 })))
       .child(div().w(1).h(18).bg(t.border).mx(4))
       .child(div().id(`dbx-mode-${tab.id}`).h(26).px(8).flex().items_center().gap(6).rounded(6).text_size(12).cursor_pointer()
@@ -1123,6 +1147,8 @@ export default class Dbx extends View {
     return v_flex().size_full().min_h(0)
       .child(toolbar)
       .when(Boolean(confirm), (e) => e.child(confirm))
+      .when(Boolean(tab.saving), (e) => e.child(saveBar(this, tab, t)))
+      .when(Boolean(tab.ask), (e) => e.child(askBar(this, tab, t)))
       .child(v_resizable(`dbx-split-${tab.id}`).flex_1().min_h(0)
         .child(resizable_panel().size(200).size_range(80, 2000).child(v_flex().size_full().min_h(0)
           .child(v_flex().id(`dbx-editor-${tab.id}`).flex_1().min_h(0).key_context(tab.suggestions.length ? "DbxConsole DbxCompleting" : "DbxConsole")
@@ -1130,7 +1156,8 @@ export default class Dbx extends View {
             .child(Editor.new(tab.editor).flex_1().min_h(0)))))
         .child(resizable_panel().child(div().relative().size_full().flex().flex_col()
           .child(this.results(tab, t, text))
-          .when(Boolean(suggestions), (e) => e.child(suggestions)))));
+          .when(Boolean(suggestions), (e) => e.child(suggestions))
+          .when(Boolean(tab.find), (e) => e.child(finderPanel(this, tab, t, this.font()))))));
   }
 
   structure(tab, t) {
@@ -1187,6 +1214,7 @@ export default class Dbx extends View {
           .child(seg(`dbx-struct-${tab.id}`, "Structure", tab.view === "structure", (cx) => { tab.view = "structure"; cx.notify(); })))
         .child(this.button(`dbx-reload-${tab.id}`, "↻", (cx) => this.loadTable(tab, cx), { t })))
       .when(tab.view === "data", (e) => e
+        .when(Boolean(tab.ask), (e) => e.child(askBar(this, tab, t)))
         .when(!tab.step, (e) => e.child(h_flex().h(40).flex_none().px(10).gap(8).items_center().border_b(1).border_color(t.border)
           .child(div().text_size(11).text_color(t.dim).child("WHERE")).child(field(tab.whereInput, "fill").key_context("DbxWhere"))
           .child(div().text_size(11).text_color(t.dim).child("ORDER BY")).child(field(tab.orderInput, 170).key_context("DbxOrder"))))
@@ -1228,6 +1256,17 @@ export default class Dbx extends View {
       .on_action("dbx_line_moveDown", (_e, cx) => this.lineCommand("moveLines", cx, 1))
       .on_action("dbx_line_toggleComment", (_e, cx) => this.lineCommand("toggleComment", cx))
       .on_action("dbx_filter_down", (_e, cx) => this.treeFromFilter(false, cx))
+      .on_action("dbx_find", (_e, cx) => { const t = this.activeTab(); if (t?.kind === "console") openFinder(this, t, cx); })
+      .on_action("dbx_save", (_e, cx) => { const t = this.activeTab(); if (t?.kind === "console") openSave(this, t, cx); })
+      .on_action("dbx_find_up", (_e, cx) => finderKey(this, this.activeTab(), "up", cx))
+      .on_action("dbx_find_down", (_e, cx) => finderKey(this, this.activeTab(), "down", cx))
+      .on_action("dbx_find_tab", (_e, cx) => finderKey(this, this.activeTab(), "tab", cx))
+      .on_action("dbx_find_escape", (_e, cx) => finderKey(this, this.activeTab(), "escape", cx))
+      .on_action("dbx_find_enter", (_e, cx) => finderKey(this, this.activeTab(), "enter", cx))
+      .on_action("dbx_find_run", (_e, cx) => finderKey(this, this.activeTab(), "run", cx))
+      .on_action("dbx_save_cancel", (_e, cx) => { const t = this.activeTab(); if (t) { t.saving = null; t.editor?.focus(); cx.notify(); } })
+      .on_action("dbx_ask_cancel", (_e, cx) => { const t = this.activeTab(); if (t) closeAsk(this, t, cx); })
+      .on_action("dbx_ask_next", (_e, cx) => { const a = this.activeTab()?.ask; if (a) { a.at = (a.at + 1) % a.agents.length; cx.notify(); } })
       .on_action("dbx_fill_where_tab", (_e, cx) => this.fillField("where", "tab", cx))
       .on_action("dbx_fill_where_right", (_e, cx) => this.fillField("where", "right", cx))
       .on_action("dbx_fill_order_tab", (_e, cx) => this.fillField("order", "tab", cx))

@@ -155,3 +155,33 @@ export function changeSql(rel, set, pk, pending, deleted) {
   for (const r of [...deleted].sort((a, b) => a - b)) out.push({ row: r, sql: `DELETE FROM ${rel} WHERE ${where(r).join(" AND ")}` });
   return out;
 }
+
+/** The statement around `offset` (UTF-16), as {start, end, text}: `;` splits, outside quotes, comments and `$$` bodies. */
+export function statementAt(text, offset) {
+  const cuts = [];
+  for (let i = 0; i < text.length; i++) {
+    const c = text[i];
+    if (c === "'" || c === '"' || c === "`") {
+      for (i++; i < text.length && !(text[i] === c && text[i + 1] !== c); i += text[i] === c ? 2 : 1);
+    } else if (c === "-" && text[i + 1] === "-") {
+      i = text.indexOf("\n", i); if (i < 0) break;
+    } else if (c === "/" && text[i + 1] === "*") {
+      i = text.indexOf("*/", i + 2); if (i < 0) break; i++;
+    } else if (c === "$") {
+      const tag = /^\$[A-Za-z_]?\w*\$/.exec(text.slice(i))?.[0];
+      if (tag) { const end = text.indexOf(tag, i + tag.length); if (end < 0) break; i = end + tag.length - 1; }
+    } else if (c === ";") cuts.push(i);
+  }
+  let start = 0;
+  for (const cut of cuts) {
+    if (offset <= cut) return trimmed(text, start, cut);
+    start = cut + 1;
+  }
+  return trimmed(text, start, text.length);
+}
+
+function trimmed(text, start, end) {
+  const s = text.slice(start, end), lead = s.length - s.trimStart().length;
+  const body = s.trim();
+  return { start: start + lead, end: start + lead + body.length, text: body };
+}

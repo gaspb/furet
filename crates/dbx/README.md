@@ -25,6 +25,7 @@ Secret Service (GNOME Keyring, KWallet, KeePassXC). For the herdr panel, see [he
 dbx                     pick a connection (type to filter); back to the list when the client exits
 dbx <name> [-w]         open it in its client (psql, clickhouse-client, or yours)
 dbx ls [-a] [--json]    connections visible from here (⇄ = tunnel, green when up)
+dbx query <name> "sql"  run SQL through the engine, print a table (--json, --csv, --saved <q>, - for stdin)
 dbx run <name> -- cmd   run cmd with PG*/CLICKHOUSE_* and DATABASE_URL set, tunnel up
 dbx url <name>          the URL, password included        dbx env <name>   as export lines
 dbx tunnel <name>       keep a tunnel up until Ctrl-C
@@ -134,15 +135,27 @@ A repo only sees its own connections, the repos it `include`s, and the global on
 - Editing a connection keeps its saved password only while host, port and user stay the same.
 - Tunnels are never shared between different connections (see `tunnel` above).
 
+## History and saved queries
+
+Every statement the engine runs is kept, per repo and connection: from the panel's consoles, from `dbx query`, and
+from agents through it (marked with the agent's name, so you see what they ran against stg). Saved queries are files
+in the repo, `.dbx/queries/<name>.sql` (a first line `-- connection: stg` says where they run), so the team shares
+them through git and agents can run them: `dbx query stg --saved stuck-invoices`. In the panel, Ctrl+R searches both
+and Ctrl/Cmd+S saves the statement under the cursor.
+
 ## With agents
 
-`dbx --skill` prints a guide for agents: list connections, run queries through `dbx run`, never lift
-read-only on their own. For Claude Code, add to `~/.claude/CLAUDE.md`:
+`dbx --skill` prints a guide for agents: list connections, look at data with `dbx query` (or run their own tools
+through `dbx run`), never lift read-only on their own. For Claude Code, add to `~/.claude/CLAUDE.md`:
 
 ```
 - The user's database connections are managed with `dbx`. Before querying a database or asking
   for credentials, run `dbx --skill` and follow it.
 ```
+
+From the herdr panel, **Ask agent** (on a statement, an error, a result or a table) sends your question to an agent
+in the same space with what it needs: the connection and its stage, the SQL, the error, the tables involved, and how
+to query on its own with `dbx query`. Row values go along only from local, dev and test connections.
 
 ## herdr
 
@@ -183,4 +196,6 @@ idle for 30 minutes. Postgres and ClickHouse.
 | `GET /sessions/:id/catalog` · `/table?schema=&name=` | schemas, tables and columns; one table's columns, indexes, constraints (ClickHouse: databases; engine, keys, skipping indexes and `create`) |
 | `POST /sessions/:id/apply` `{statements}` | row edits in one transaction (Postgres) |
 | `POST /sessions/:id/lookup` `{schema, table, column, value \| values, limit?}` | the rows where `column = value` (or `in values`), Postgres. Result columns carry `origin` (the table column they copy) and, for a foreign key, `refs` (where it points) |
+| `GET /history?cwd=&name=&limit=` | the statements that ran here (one connection, or all), newest first |
+| `GET /queries?cwd=` · `POST /queries` `{cwd, name, sql, connection?}` · `DELETE /queries?cwd=&name=` | the repo's saved queries |
 | `POST /sessions/:id/referrers` `{schema, table, row}` | the foreign keys pointing at that row, each with how many rows point there (counted up to 1000) |

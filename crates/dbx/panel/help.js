@@ -14,6 +14,8 @@ export const KEYS = [
     ["Ctrl+Space", "suggestions (they also show while you type)"],
     ["↑ ↓ · PgUp PgDn", "move through suggestions (PgUp PgDn: Fn ↑ ↓ on a Mac laptop)"],
     ["Tab · Enter", "take the suggestion · Esc closes the list"],
+    ["Ctrl+R", "find a saved query or one that ran before (yours, agents'): Enter puts it in, ⌘ Enter runs it, Tab: every connection"],
+    ["⌘ S", "save the statement under the cursor in .dbx/queries (commit it to share)"],
     ["⌘ C · ⌘ X", "copy or cut the line when nothing is selected"],
     ["Ctrl+D", "duplicate the line or the selection"],
     ["⌥⇧↑ · ⌥⇧↓", "move the line (or the selected lines)"],

@@ -4,6 +4,7 @@ mod detect;
 mod engine;
 mod panel;
 mod picker;
+mod query;
 mod store;
 mod tunnel;
 mod update;
@@ -73,6 +74,24 @@ enum Cmd {
         write: bool,
         #[arg(last = true, required = true)]
         argv: Vec<String>,
+    },
+    /// Run SQL through the engine and print the result (read-only rules apply; kept in the history)
+    Query {
+        name: String,
+        /// The SQL; `-` reads it from stdin
+        sql: Option<String>,
+        /// A saved query (.dbx/queries/<name>.sql) instead
+        #[arg(long, conflicts_with = "sql")]
+        saved: Option<String>,
+        #[arg(short, long)]
+        write: bool,
+        #[arg(long, conflicts_with = "csv")]
+        json: bool,
+        #[arg(long)]
+        csv: bool,
+        /// Rows per result
+        #[arg(long, default_value_t = 200)]
+        limit: usize,
     },
     /// Print the connection URL, password included
     Url {
@@ -185,6 +204,46 @@ fn command(cmd: Cmd, cwd: &Path) -> Result<i32> {
             let scope = Scope::load_for(cwd, &name)?;
             let (r, _tunnel) = prepare(&scope, &name, write)?;
             exec(&r, &argv)
+        }
+        Cmd::Query {
+            name,
+            sql,
+            saved,
+            write,
+            json,
+            csv,
+            limit,
+        } => {
+            let sql = match (sql, saved) {
+                (_, Some(s)) => query::saved_sql(cwd, &s)?,
+                (Some(s), None) if s == "-" => std::io::read_to_string(std::io::stdin())?,
+                (Some(s), None) => s,
+                (None, None) => bail!("give the SQL (- reads it from stdin), or --saved <name>"),
+            };
+            let scope = Scope::load_for(cwd, &name)?;
+            let e = scope.get(&name)?;
+            let confirm = if write && e.conn.is_prod() && e.conn.readonly() {
+                confirm_prod(&name)?;
+                Some(name.clone())
+            } else {
+                None
+            };
+            let format = match (json, csv) {
+                (true, _) => query::Format::Json,
+                (_, true) => query::Format::Csv,
+                _ => query::Format::Table,
+            };
+            query::run(
+                cwd,
+                query::Args {
+                    name: &name,
+                    sql: &sql,
+                    write,
+                    confirm,
+                    format,
+                    limit,
+                },
+            )
         }
         Cmd::Url { name, write } => {
             let scope = Scope::load_for(cwd, &name)?;
