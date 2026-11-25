@@ -63,7 +63,9 @@ stage = "prod"
   Postgres sessions get `default_transaction_read_only`, ClickHouse `readonly=1` (`readonly=2` in the
   engine, which lets queries keep their `SETTINGS` but not lower `readonly`). `-w` lifts it,
   and on `prod` asks you to type the connection's name. It is a guard against mistakes, not a permission system:
-  use a read-only database user for that.
+  use a read-only database user for that. In the engine, statements that would lift it
+  (`set default_transaction_read_only`, `begin read write`, `reset all`, `set_config`, `do`…) are refused, and
+  each run re-reads the server's setting, so the panel shows what's true. Clients you open hand the session to you.
 - `client = ["pgcli"]` picks another program; `{url}`, `{host}`, `{port}`, `{user}`, `{password}`, `{database}`
   are filled in. A default per kind goes in the global file:
 
@@ -85,8 +87,10 @@ Running Postgres and ClickHouse containers show up without configuring anything 
 under `docker` in `dbx ls`, the picker and the panel. User, password and database come from the container's environment
 (`POSTGRES_USER`/`POSTGRES_PASSWORD`/`POSTGRES_DB`, `CLICKHOUSE_*`) each time; nothing is written. The address is the
 published port (`localhost:5433`; for ClickHouse 9000's, and 8123's as `http_port`), else the container's IP (Linux only). Containers from this repo's compose file
-(found from compose's labels, worktrees included) come first and go by their service name (`dbx run db -- psql`);
-others by their container name. A configured connection with the same name wins. `DBX_DOCKER=0` turns this off.
+(compose's labels put its working directory and compose files inside the repo, worktrees included) come first and
+go by their service name (`dbx run db -- psql`), with their password. Others are listed by container name without
+it: Save… one to use it from this repo, which reads its password then, into the keychain. A configured
+connection with the same name wins, and the container goes by its container name. `DBX_DOCKER=0` turns this off.
 `docker` is looked for on the PATH, then where Docker Desktop, Homebrew, OrbStack, Rancher Desktop and Colima install it
 (apps started from the Dock get a minimal PATH); `DBX_DOCKER_BIN` points at another one. When Docker can't be asked,
 `dbx ls` and the panel say why. A container whose port isn't published is listed with a note: it can't be reached
@@ -125,7 +129,8 @@ idle for 30 minutes. Postgres and ClickHouse.
   use your connections. The token is in `~/.local/state/dbx/serve.json`, readable only by you;
   your own processes can read it, as they can read your connection files.
 - Secrets (`env`, `dotenv`, `cmd`) are read by the engine when a session opens: `{ env = … }` sees
-  the engine's environment (the herdr app's), not the terminal you typed in.
+  the engine's environment (the herdr app's), not the terminal you typed in. A repo's `dotenv` files must be
+  inside it. Editing a connection keeps its saved password only while host, port and user stay the same.
 - Read-only works as in the CLI; writes on prod need the connection's name in `confirm`.
 - ClickHouse goes through its HTTP interface (`http_port`), with a server-side session per panel session
   (`USE` and `SET` last): statements run one request each, in order; cancel is `KILL QUERY`; rows aren't

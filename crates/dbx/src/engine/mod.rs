@@ -110,7 +110,9 @@ impl Session {
 #[derive(Default)]
 pub struct Engine {
     sessions: Mutex<HashMap<String, Arc<Session>>>,
-    tunnels: Mutex<HashMap<(String, u16), Weak<Tunnel>>>,
+    /// One slot per connection definition, locked while its tunnel starts.
+    tunnels: Mutex<HashMap<String, Arc<Mutex<Weak<Tunnel>>>>>,
+    roots: Mutex<HashMap<String, PathBuf>>,
     pub last_request: Mutex<Option<Instant>>,
 }
 
@@ -222,12 +224,19 @@ impl Engine {
     }
 
     /// Connects with a draft (tunnel included) without saving it.
-    pub fn test(&self, req: DraftReq) -> Result<Value, Fail> {
+    pub fn test(&self, mut req: DraftReq) -> Result<Value, Fail> {
+        store::from_docker(&mut req.draft).map_err(|e| Fail(400, format!("{e:#}")))?;
         let scope = Scope::load(&req.cwd)?;
+        let target = if req.draft.global {
+            crate::config::Origin::Global
+        } else {
+            crate::config::Origin::Project
+        };
         let existing = req
             .previous
             .as_deref()
             .and_then(|p| scope.get(p).ok())
+            .filter(|e| scope.layer(e).origin == target)
             .map(|e| e.conn.clone());
         let conn = store::conn_of(&req.draft, existing.as_ref())
             .map_err(|e| Fail(400, format!("{e:#}")))?;
@@ -236,10 +245,20 @@ impl Engine {
             layer: 0,
             conn,
         };
-        let layer = &scope.layers[0];
+        let layer = scope
+            .layers
+            .iter()
+            .find(|l| l.origin == target)
+            .unwrap_or(&scope.layers[0]);
         let r = conn::resolve(&entry, layer).map_err(|e| Fail(400, format!("{e:#}")))?;
+        let file = layer.file.clone();
+        let owner = format!(
+            "{}#{}",
+            crate::config::tilde(&file),
+            req.previous.as_deref().unwrap_or(&req.draft.name)
+        );
         let _tunnel = match &entry.conn.tunnel {
-            Some(cmd) => self.tunnel(cmd, &r.host, engine_port(&r), &layer.base)?,
+            Some(cmd) => self.tunnel(cmd, &r.host, engine_port(&r), &layer.base, &owner)?,
             None => None,
         };
         match Backend::connect(&r) {
@@ -248,7 +267,8 @@ impl Engine {
         }
     }
 
-    pub fn save(&self, req: DraftReq) -> Result<Value, Fail> {
+    pub fn save(&self, mut req: DraftReq) -> Result<Value, Fail> {
+        store::from_docker(&mut req.draft).map_err(|e| Fail(400, format!("{e:#}")))?;
         let saved = store::save(&req.cwd, &req.draft, req.previous.as_deref())
             .map_err(|e| Fail(400, format!("{e:#}")))?;
         Ok(serde_json::to_value(saved)?)
@@ -279,7 +299,13 @@ impl Engine {
             r.readonly = false;
         }
         let tunnel = match &entry.conn.tunnel {
-            Some(cmd) => self.tunnel(cmd, &r.host, engine_port(&r), &layer.base)?,
+            Some(cmd) => self.tunnel(
+                cmd,
+                &r.host,
+                engine_port(&r),
+                &layer.base,
+                &scope.owner(entry),
+            )?,
             None => None,
         };
         let backend = Backend::connect(&r).map_err(|e| Fail(502, format!("{e:#}")))?;
@@ -316,31 +342,48 @@ impl Engine {
         Ok(v)
     }
 
-    /// Sessions on the same tunnelled port share one tunnel; it stops with the last of them.
+    /// Sessions on the same connection definition share its tunnel; it stops with the last of them.
+    /// Starting one only blocks other opens of that same definition.
     fn tunnel(
         &self,
         cmd: &str,
         host: &str,
         port: u16,
         base: &std::path::Path,
+        owner: &str,
     ) -> Result<Option<Arc<Tunnel>>, Fail> {
-        let key = (host.to_string(), port);
-        let mut tunnels = self.tunnels.lock().unwrap();
-        if let Some(t) = tunnels.get(&key).and_then(Weak::upgrade) {
+        let slot = self
+            .tunnels
+            .lock()
+            .unwrap()
+            .entry(owner.to_string())
+            .or_default()
+            .clone();
+        let mut held = slot.lock().unwrap();
+        if let Some(t) = held.upgrade() {
             return Ok(Some(t));
         }
-        match Tunnel::ensure(cmd, host, port, base).map_err(|e| Fail(502, format!("{e:#}")))? {
+        match Tunnel::ensure(cmd, host, port, base, owner)
+            .map_err(|e| Fail(502, format!("{e:#}")))?
+        {
             Some(t) => {
                 let t = Arc::new(t);
-                tunnels.insert(key, Arc::downgrade(&t));
+                *held = Arc::downgrade(&t);
                 Ok(Some(t))
             }
             None => Ok(None),
         }
     }
 
-    pub fn session(&self, id: &str) -> Result<Arc<Session>, Fail> {
-        let s = self.sessions.lock().unwrap().get(id).cloned();
+    /// A session of the repo at `root`: another repo's session doesn't exist from here.
+    pub fn session(&self, root: &std::path::Path, id: &str) -> Result<Arc<Session>, Fail> {
+        let s = self
+            .sessions
+            .lock()
+            .unwrap()
+            .get(id)
+            .cloned()
+            .filter(|s| s.root == root);
         let Some(s) = s else {
             return fail(
                 404,
@@ -351,26 +394,44 @@ impl Engine {
         Ok(s)
     }
 
-    pub fn list(&self) -> Value {
+    /// The repo a client folder belongs to (cached: resolving runs git).
+    pub fn root_of(&self, cwd: &str) -> Result<PathBuf, Fail> {
+        if let Some(r) = self.roots.lock().unwrap().get(cwd) {
+            return Ok(r.clone());
+        }
+        let root = Scope::load(std::path::Path::new(cwd))?.root;
+        self.roots
+            .lock()
+            .unwrap()
+            .insert(cwd.to_string(), root.clone());
+        Ok(root)
+    }
+
+    pub fn list(&self, root: &std::path::Path) -> Value {
         Value::Array(
             self.sessions
                 .lock()
                 .unwrap()
                 .values()
+                .filter(|s| s.root == root)
                 .map(|s| s.describe())
                 .collect(),
         )
     }
 
-    pub fn close(&self, id: &str) -> Result<Value, Fail> {
-        match self.sessions.lock().unwrap().remove(id) {
-            Some(_) => Ok(json!({ "closed": id })),
-            None => fail(404, "no such session"),
+    pub fn close(&self, root: &std::path::Path, id: &str) -> Result<Value, Fail> {
+        let mut sessions = self.sessions.lock().unwrap();
+        match sessions.get(id) {
+            Some(s) if s.root == root => {
+                sessions.remove(id);
+                Ok(json!({ "closed": id }))
+            }
+            _ => fail(404, "no such session"),
         }
     }
 
-    pub fn query(&self, id: &str, req: QueryReq) -> Result<Value, Fail> {
-        let s = self.session(id)?;
+    pub fn query(&self, root: &std::path::Path, id: &str, req: QueryReq) -> Result<Value, Fail> {
+        let s = self.session(root, id)?;
         let sql = &req.sql;
         let clamp = |o: usize| sql::utf16_to_byte(sql, o);
         let range = if req.all {
@@ -383,6 +444,16 @@ impl Engine {
                 None => return fail(400, "nothing to run"),
             }
         };
+        let readonly = s.readonly.load(Ordering::SeqCst);
+        if readonly
+            && matches!(s.backend, Backend::Pg { .. })
+            && sql::lifts_readonly(&sql[range.0..range.1])
+        {
+            return fail(
+                409,
+                "that would turn read-only off: switch the session to read-write instead (prod asks to confirm)",
+            );
+        }
         let limit = req.limit.unwrap_or(500).clamp(1, 10_000);
         let out = match &s.backend {
             Backend::Pg { pg, .. } => pg
@@ -394,11 +465,26 @@ impl Engine {
         if out.error.as_ref().is_some_and(|e| e.closed) {
             self.sessions.lock().unwrap().remove(id);
         }
-        Ok(serde_json::to_value(out)?)
+        let mut v = serde_json::to_value(out)?;
+        if let Backend::Pg { pg, .. } = &s.backend {
+            let mut pg = pg.lock().unwrap();
+            match pg.is_readonly() {
+                Some(false) if readonly => {
+                    let _ = pg.set_readonly(true);
+                    if v["error"].is_null() {
+                        v["error"] = json!({ "message": "that turned read-only off; dbx turned it back on" });
+                    }
+                }
+                Some(now) => s.readonly.store(now, Ordering::SeqCst),
+                None => {}
+            }
+        }
+        v["readonly"] = json!(s.readonly.load(Ordering::SeqCst));
+        Ok(v)
     }
 
-    pub fn cancel(&self, id: &str) -> Result<Value, Fail> {
-        let s = self.session(id)?;
+    pub fn cancel(&self, root: &std::path::Path, id: &str) -> Result<Value, Fail> {
+        let s = self.session(root, id)?;
         match &s.backend {
             Backend::Pg { cancel, .. } => {
                 let (token, tls) = cancel.clone();
@@ -409,8 +495,8 @@ impl Engine {
         Ok(json!({ "cancelled": id }))
     }
 
-    pub fn mode(&self, id: &str, req: ModeReq) -> Result<Value, Fail> {
-        let s = self.session(id)?;
+    pub fn mode(&self, root: &std::path::Path, id: &str, req: ModeReq) -> Result<Value, Fail> {
+        let s = self.session(root, id)?;
         check_write(&s.name, s.prod, req.write, req.confirm.as_deref())?;
         match &s.backend {
             Backend::Pg { pg, .. } => pg.lock().unwrap().set_readonly(!req.write)?,
@@ -422,18 +508,24 @@ impl Engine {
         Ok(s.describe())
     }
 
-    pub fn catalog(&self, id: &str) -> Result<Value, Fail> {
-        let s = self.session(id)?;
+    pub fn catalog(&self, root: &std::path::Path, id: &str) -> Result<Value, Fail> {
+        let s = self.session(root, id)?;
         Ok(match &s.backend {
             Backend::Pg { pg, .. } => pg.lock().unwrap().catalog()?,
             Backend::Ch(ch) => ch.catalog()?,
         })
     }
 
-    pub fn apply(&self, id: &str, req: ApplyReq) -> Result<Value, Fail> {
-        let s = self.session(id)?;
+    pub fn apply(&self, root: &std::path::Path, id: &str, req: ApplyReq) -> Result<Value, Fail> {
+        let s = self.session(root, id)?;
         if req.statements.is_empty() {
             return fail(400, "nothing to apply");
+        }
+        if s.readonly.load(Ordering::SeqCst) {
+            return fail(
+                409,
+                "the session is read-only: switch it to read-write to apply changes",
+            );
         }
         let Backend::Pg { pg, .. } = &s.backend else {
             return fail(
@@ -449,8 +541,14 @@ impl Engine {
         })
     }
 
-    pub fn table(&self, id: &str, schema: &str, name: &str) -> Result<Value, Fail> {
-        let s = self.session(id)?;
+    pub fn table(
+        &self,
+        root: &std::path::Path,
+        id: &str,
+        schema: &str,
+        name: &str,
+    ) -> Result<Value, Fail> {
+        let s = self.session(root, id)?;
         Ok(match &s.backend {
             Backend::Pg { pg, .. } => pg.lock().unwrap().table(schema, name)?,
             Backend::Ch(ch) => ch.table(schema, name)?,

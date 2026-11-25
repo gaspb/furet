@@ -280,7 +280,7 @@ fn prepare(scope: &Scope, name: &str, write: bool) -> Result<(Resolved, Option<T
     let r = resolve(scope, name, write)?;
     let e = scope.get(name)?;
     let tunnel = match &e.conn.tunnel {
-        Some(cmd) => Tunnel::ensure(cmd, &r.host, r.port, &scope.layer(e).base)?,
+        Some(cmd) => Tunnel::ensure(cmd, &r.host, r.port, &scope.layer(e).base, &scope.owner(e))?,
         None => None,
     };
     Ok((r, tunnel))
@@ -382,7 +382,8 @@ fn keep_tunnel(scope: &Scope, name: &str) -> Result<i32> {
         bail!("{name} has no tunnel")
     };
     let r = conn::resolve(e, scope.layer(e))?;
-    let Some(mut t) = Tunnel::ensure(cmd, &r.host, r.port, &scope.layer(e).base)? else {
+    let Some(mut t) = Tunnel::ensure(cmd, &r.host, r.port, &scope.layer(e).base, &scope.owner(e))?
+    else {
         eprintln!(
             "{}:{} is already reachable (another tunnel?)",
             r.host, r.port
@@ -629,9 +630,18 @@ fn copy(cwd: &Path, name: &str, from: &Path, rename: Option<&str>) -> Result<i32
     let e = source.get(name)?;
     let src_file = &source.layer(e).file;
     let src: DocumentMut = std::fs::read_to_string(src_file)?.parse()?;
-    let item = src["conn"][name].clone();
+    let mut item = src["conn"][name].clone();
     let new = rename.unwrap_or(name);
     let file = store::target_file(cwd, false)?;
+    // A keychain password is copied into this repo's own entry: references never cross repos.
+    if let Some(config::Value::Keychain { keychain }) = &e.conn.password {
+        let secret = store::keychain_get(keychain)?;
+        let account = store::account(&tilde(&common::scope::project_root(cwd)), new);
+        store::keychain_set(&account, &secret)?;
+        let mut it = toml_edit::InlineTable::new();
+        it.insert("keychain", account.as_str().into());
+        item["password"] = toml_edit::value(it);
+    }
     let mut doc = store::load_doc(&file)?;
     let conns = doc
         .entry("conn")

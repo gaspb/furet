@@ -206,6 +206,18 @@ impl Pg {
         Ok(())
     }
 
+    /// What the server says now, not what was asked: a statement may have changed it.
+    pub fn is_readonly(&mut self) -> Option<bool> {
+        let rows = self
+            .client
+            .simple_query("show default_transaction_read_only")
+            .ok()?;
+        rows.iter().find_map(|m| match m {
+            postgres::SimpleQueryMessage::Row(r) => r.get(0).map(|v| v == "on"),
+            _ => None,
+        })
+    }
+
     /// Runs `sql[range]` (byte range). A lone read-only statement runs as a page of `limit` rows.
     pub fn run(
         &mut self,

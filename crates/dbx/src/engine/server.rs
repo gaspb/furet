@@ -46,7 +46,7 @@ fn build_id() -> String {
         .unwrap_or_default()
 }
 
-fn dir() -> PathBuf {
+pub(crate) fn dir() -> PathBuf {
     std::env::var_os("DBX_STATE")
         .map(PathBuf::from)
         .unwrap_or_else(|| common::scope::state_home().join("dbx"))
@@ -133,7 +133,31 @@ pub fn stop() -> bool {
 }
 
 /// Prints the running server's address and token, starting one in the background if needed.
+/// Whether a dbx engine holds the lock: only your processes can open it (0700 folder), so a
+/// `serve.json` without a holder is stale, whatever answers on its port.
+fn engine_running() -> bool {
+    let Ok(lock) = fs::OpenOptions::new()
+        .write(true)
+        .open(dir().join("serve.lock"))
+    else {
+        return false;
+    };
+    let free = unsafe {
+        libc::flock(
+            std::os::fd::AsRawFd::as_raw_fd(&lock),
+            libc::LOCK_EX | libc::LOCK_NB,
+        )
+    } == 0;
+    if free {
+        unsafe { libc::flock(std::os::fd::AsRawFd::as_raw_fd(&lock), libc::LOCK_UN) };
+    }
+    !free
+}
+
 pub fn ensure() -> Result<Info> {
+    if !engine_running() {
+        let _ = fs::remove_file(info_file());
+    }
     if let Some(info) = read_info() {
         match running(&info) {
             Some(_) if current(&info) => return Ok(info),
@@ -165,7 +189,7 @@ pub fn ensure() -> Result<Info> {
     let mut found = None;
     wait_for(
         || {
-            found = read_info().filter(current);
+            found = read_info().filter(|i| engine_running() && current(i));
             found.is_some()
         },
         "dbx serve to start",
@@ -222,6 +246,7 @@ pub fn serve(idle: Duration) -> Result<()> {
         build: build_id(),
     };
     write_info(&info)?;
+    crate::tunnel::remove_on_signal(&info_file());
     eprintln!(
         "dbx serve {VERSION} listening on {} (pid {})",
         info.url, info.pid
@@ -303,7 +328,12 @@ fn respond(engine: &Engine, info: &Info, mut req: Request) -> bool {
             .collect();
     let segments: Vec<&str> = path.trim_matches('/').split('/').collect();
     let mut body = String::new();
-    let read = req.as_reader().take(BODY_MAX).read_to_string(&mut body);
+    // Nothing of a request is read before it's authorised.
+    let read = if host_ok && token_ok {
+        req.as_reader().take(BODY_MAX).read_to_string(&mut body)
+    } else {
+        Ok(0)
+    };
 
     let mut shutdown = false;
     let result: Result<Value, Fail> = if !host_ok || !token_ok {
@@ -321,6 +351,8 @@ fn respond(engine: &Engine, info: &Info, mut req: Request) -> bool {
                 .cloned()
                 .ok_or_else(|| Fail(400, format!("missing ?{k}=")))
         };
+        // Session routes act for the repo the caller says it's in, on that repo's sessions only.
+        let root = || param("cwd").and_then(|c| engine.root_of(&c));
         match (&method, segments.as_slice()) {
             (Method::Get, ["health"]) => Ok(
                 json!({ "version": VERSION, "build": info.build, "pid": info.pid, "sessions": engine.session_count() }),
@@ -354,34 +386,39 @@ fn respond(engine: &Engine, info: &Info, mut req: Request) -> bool {
             (Method::Delete, ["connections"]) => {
                 param("cwd").and_then(|c| param("name").and_then(|n| engine.remove(&c, &n)))
             }
-            (Method::Get, ["sessions"]) => Ok(engine.list()),
+            (Method::Get, ["sessions"]) => root().map(|r| engine.list(&r)),
             (Method::Post, ["sessions"]) => parse(&body)
                 .and_then(|v| {
                     serde_json::from_value::<OpenReq>(v).map_err(|e| Fail(400, e.to_string()))
                 })
                 .and_then(|r| engine.open(r)),
-            (Method::Delete, ["sessions", id]) => engine.close(id),
+            (Method::Delete, ["sessions", id]) => root().and_then(|r| engine.close(&r, id)),
             (Method::Post, ["sessions", id, "query"]) => parse(&body)
                 .and_then(|v| {
                     serde_json::from_value::<QueryReq>(v).map_err(|e| Fail(400, e.to_string()))
                 })
-                .and_then(|r| engine.query(id, r)),
-            (Method::Post, ["sessions", id, "cancel"]) => engine.cancel(id),
+                .and_then(|q| root().and_then(|r| engine.query(&r, id, q))),
+            (Method::Post, ["sessions", id, "cancel"]) => {
+                root().and_then(|r| engine.cancel(&r, id))
+            }
             (Method::Post, ["sessions", id, "mode"]) => parse(&body)
                 .and_then(|v| {
                     serde_json::from_value::<ModeReq>(v).map_err(|e| Fail(400, e.to_string()))
                 })
-                .and_then(|r| engine.mode(id, r)),
+                .and_then(|m| root().and_then(|r| engine.mode(&r, id, m))),
             (Method::Post, ["sessions", id, "apply"]) => parse(&body)
                 .and_then(|v| {
                     serde_json::from_value::<super::ApplyReq>(v)
                         .map_err(|e| Fail(400, e.to_string()))
                 })
-                .and_then(|r| engine.apply(id, r)),
-            (Method::Get, ["sessions", id, "catalog"]) => engine.catalog(id),
-            (Method::Get, ["sessions", id, "table"]) => {
-                param("schema").and_then(|s| param("name").and_then(|n| engine.table(id, &s, &n)))
+                .and_then(|a| root().and_then(|r| engine.apply(&r, id, a))),
+            (Method::Get, ["sessions", id, "catalog"]) => {
+                root().and_then(|r| engine.catalog(&r, id))
             }
+            (Method::Get, ["sessions", id, "table"]) => root().and_then(|r| {
+                param("schema")
+                    .and_then(|s| param("name").and_then(|n| engine.table(&r, id, &s, &n)))
+            }),
             _ => fail(404, format!("no route for {method} {path}")),
         }
     };

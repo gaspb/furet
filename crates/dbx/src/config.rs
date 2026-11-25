@@ -69,6 +69,9 @@ pub struct Conn {
     /// Why it can't be reached (a container whose port isn't published); never in a file.
     #[serde(skip)]
     pub unreachable: Option<String>,
+    /// The Docker container it was found in; never in a file.
+    #[serde(skip)]
+    pub container: Option<String>,
 }
 
 impl Conn {
@@ -139,11 +142,41 @@ pub fn project_file(root: &Path) -> PathBuf {
     home().join("projects").join(scope::encode(root)).join(FILE)
 }
 
+/// Moves a project's folder from its old, ambiguous name, if it's really this project's.
+fn migrate(root: &Path) {
+    let new = home().join("projects").join(scope::encode(root));
+    let old = home().join("projects").join(scope::legacy_encode(root));
+    let ours = fs::read_to_string(old.join(ROOT_FILE)).is_ok_and(|r| Path::new(r.trim()) == root);
+    if !new.exists() && ours {
+        let _ = fs::rename(&old, &new);
+    }
+}
+
+/// The project's connections file, after checking its folder is really this project's.
+fn checked_project_file(root: &Path) -> Result<PathBuf> {
+    migrate(root);
+    let file = project_file(root);
+    if let Ok(recorded) = fs::read_to_string(file.with_file_name(ROOT_FILE))
+        && Path::new(recorded.trim()) != root
+    {
+        anyhow::bail!(
+            "{} belongs to {}, not {}: not using it",
+            file.parent().unwrap().display(),
+            recorded.trim(),
+            root.display()
+        );
+    }
+    Ok(file)
+}
+
 /// Creates a project's directory, recording which repo it is for.
 pub fn ensure_project_dir(root: &Path) -> Result<PathBuf> {
-    let file = project_file(root);
+    let file = checked_project_file(root)?;
     let dir = file.parent().unwrap();
     fs::create_dir_all(dir).with_context(|| format!("cannot create {}", dir.display()))?;
+    for d in [home(), home().join("projects")] {
+        let _ = fs::set_permissions(d, std::os::unix::fs::PermissionsExt::from_mode(0o700));
+    }
     fs::write(dir.join(ROOT_FILE), root.to_string_lossy().as_bytes())?;
     Ok(file)
 }
@@ -181,6 +214,16 @@ pub struct Layer {
 }
 
 impl Layer {
+    /// The keychain accounts this file's connections may use: `global#…` or `<repo>#…`. A
+    /// reference to another repo's account (copied by hand, say) is refused rather than read.
+    pub fn keychain_prefix(&self) -> Option<String> {
+        match (self.origin, &self.root) {
+            (Origin::Global, _) => Some("global#".into()),
+            (Origin::Project | Origin::Include, Some(root)) => Some(format!("{}#", tilde(root))),
+            _ => None,
+        }
+    }
+
     pub fn label(&self) -> String {
         match (self.origin, &self.root) {
             (Origin::Global, _) => "global".into(),
@@ -192,7 +235,7 @@ impl Layer {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Entry {
     pub name: String,
     pub layer: usize,
@@ -249,7 +292,7 @@ impl Scope {
         if !seen.insert(root.to_path_buf()) {
             return Ok(());
         }
-        let file = project_file(root);
+        let file = checked_project_file(root)?;
         crate::store::tighten(&file);
         let content = File::read(&file)?;
         let includes: Vec<PathBuf> = content
@@ -286,17 +329,22 @@ impl Scope {
         }
     }
 
-    /// Adds the databases running in Docker, under names nothing configured uses.
+    /// Adds the databases running in Docker, under names nothing configured uses. Only those this
+    /// repo's compose files started come with their password; others need Save… first.
     pub fn with_detected(mut self) -> Scope {
         let worktree = self
             .layers
             .last()
             .map(|l| l.base.clone())
             .unwrap_or_else(|| self.root.clone());
-        let detection = crate::detect::running(&[&self.root, &worktree]);
+        let home = std::env::var_os("HOME").map(PathBuf::from);
+        let roots: Vec<&Path> = [self.root.as_path(), worktree.as_path()]
+            .into_iter()
+            .filter(|r| r.parent().is_some() && home.as_deref().is_none_or(|h| !h.starts_with(r)))
+            .collect();
+        let detection = crate::detect::running(&roots);
         self.docker = detection.problem;
-        let found = detection.found;
-        if found.is_empty() {
+        if detection.found.is_empty() {
             return self;
         }
         let idx = self.layers.len();
@@ -306,14 +354,28 @@ impl Scope {
             file: PathBuf::new(),
             base: worktree,
         });
-        for f in found {
-            if !self.entries.iter().any(|e| e.name == f.name) {
-                self.entries.push(Entry {
-                    name: f.name,
-                    layer: idx,
-                    conn: f.conn,
+        let shared = |n: &str| detection.found.iter().filter(|f| f.name == n).count() > 1;
+        for f in &detection.found {
+            let name = if shared(&f.name) || self.entries.iter().any(|e| e.name == f.name) {
+                f.container.clone()
+            } else {
+                f.name.clone()
+            };
+            if self.entries.iter().any(|e| e.name == name) {
+                continue;
+            }
+            let mut conn = f.conn.clone();
+            if !f.here {
+                conn.password = None;
+                conn.unreachable.get_or_insert_with(|| {
+                    "this repo's compose files didn't start it: save it to this repo first (Save… in the panel)".into()
                 });
             }
+            self.entries.push(Entry {
+                name,
+                layer: idx,
+                conn,
+            });
         }
         self
     }
@@ -342,16 +404,31 @@ impl Scope {
         anyhow::bail!("no connection named {name:?} (have: {})", names.join(", "))
     }
 
+    /// The definition a connection comes from, `<file>#<name>`: what a tunnel belongs to, so the
+    /// same global or included connection shares one, and different ones never do.
+    pub fn owner(&self, e: &Entry) -> String {
+        let l = self.layer(e);
+        let file = if l.origin == Origin::Detected {
+            "docker".to_string()
+        } else {
+            tilde(&l.file)
+        };
+        format!("{file}#{}", e.name)
+    }
+
     pub fn layer(&self, e: &Entry) -> &Layer {
         &self.layers[e.layer]
     }
 }
 
 pub fn tilde(p: &Path) -> String {
-    let s = p.to_string_lossy();
     match std::env::var("HOME") {
-        Ok(h) if !h.is_empty() && s.starts_with(&h) => format!("~{}", &s[h.len()..]),
-        _ => s.into_owned(),
+        Ok(h) if !h.is_empty() => match p.strip_prefix(&h) {
+            Ok(rest) if rest.as_os_str().is_empty() => "~".into(),
+            Ok(rest) => format!("~/{}", rest.display()),
+            Err(_) => p.display().to_string(),
+        },
+        _ => p.display().to_string(),
     }
 }
 

@@ -171,6 +171,10 @@ pub enum Password {
     },
     /// Saved in the file as is (older entries, or no keychain).
     File,
+    /// The container's own, read when saving (into the keychain).
+    Docker {
+        container: String,
+    },
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, Default)]
@@ -193,6 +197,23 @@ pub struct Draft {
 
 fn blank(s: &Option<String>) -> Option<&str> {
     s.as_deref().map(str::trim).filter(|s| !s.is_empty())
+}
+
+/// A kept password only goes where it went before: same host, port and user.
+fn same_target(old: Option<&str>, new: &str) -> Result<()> {
+    let parts = |u: &str| {
+        url::Url::parse(u.trim()).ok().map(|u| {
+            (
+                u.host_str().map(String::from),
+                u.port(),
+                u.username().to_string(),
+            )
+        })
+    };
+    if old.and_then(parts).is_none_or(|o| Some(o) != parts(new)) {
+        bail!("the host, port or user changed: type the password again");
+    }
+    Ok(())
 }
 
 /// The URL without its password, and the password it had.
@@ -218,17 +239,24 @@ pub fn draft_of(scope: &Scope, name: &str) -> Result<Draft> {
     let e = scope.get(name)?;
     let c = &e.conn;
     if scope.layer(e).origin == config::Origin::Detected {
-        // Saving a container's connection: start from where it is, password included (it goes to
-        // the keychain on save, out of the URL).
-        let mut r = crate::conn::resolve(e, scope.layer(e))?;
+        let mut e = e.clone();
+        e.conn.unreachable = None;
+        let mut r = crate::conn::resolve(&e, scope.layer(&e))?;
         if r.kind == config::Kind::Clickhouse && r.http_port != 8123 {
             r.params.push(("http_port".into(), r.http_port.to_string()));
         }
+        r.password = None;
         return Ok(Draft {
             name: name.into(),
             url: r.url(),
             stage: Some("local".into()),
             note: c.note.clone(),
+            password: match &c.container {
+                Some(container) => Password::Docker {
+                    container: container.clone(),
+                },
+                None => Password::None,
+            },
             ..Draft::default()
         });
     }
@@ -263,24 +291,57 @@ pub fn draft_of(scope: &Scope, name: &str) -> Result<Draft> {
     })
 }
 
+/// Swaps a container's password in for `Password::Docker`, checking the draft still points at it.
+pub fn from_docker(draft: &mut Draft) -> Result<()> {
+    let Password::Docker { container } = &draft.password else {
+        return Ok(());
+    };
+    let u = url::Url::parse(draft.url.trim()).context("invalid url")?;
+    let host = u
+        .host_str()
+        .unwrap_or("")
+        .trim_start_matches('[')
+        .trim_end_matches(']');
+    let user = url::form_urlencoded::parse(format!("x={}", u.username()).as_bytes())
+        .next()
+        .map(|(_, v)| v.into_owned())
+        .unwrap_or_default();
+    let port = u.port().context("the url needs the container's port")?;
+    let secret =
+        crate::detect::password(container, host, port, &user).map_err(anyhow::Error::msg)?;
+    draft.password = match secret {
+        Some(s) => Password::Keychain { secret: Some(s) },
+        None => Password::None,
+    };
+    Ok(())
+}
+
 /// A connection as it would be saved, with a keychain secret still in hand: for testing a draft.
 pub fn conn_of(draft: &Draft, existing: Option<&Conn>) -> Result<Conn> {
     let (url, url_pw) = split_password(&draft.url)?;
+    let kept = || -> Result<Option<Value>> {
+        let Some(pw) = existing.and_then(|c| c.password.clone()) else {
+            return Ok(url_pw.clone().map(Value::Plain));
+        };
+        let old_url = match existing.and_then(|c| c.url.as_ref()) {
+            Some(Value::Plain(u)) => Some(u.as_str()),
+            _ => None,
+        };
+        same_target(old_url, &url)?;
+        Ok(Some(pw))
+    };
     let password = match &draft.password {
         Password::None => url_pw.map(Value::Plain),
-        Password::Keep | Password::File => existing
-            .and_then(|c| c.password.clone())
-            .or(url_pw.map(Value::Plain)),
+        Password::Keep | Password::File => kept()?,
         Password::Keychain { secret: Some(s) } if !s.is_empty() => Some(Value::Plain(s.clone())),
-        Password::Keychain { .. } => existing
-            .and_then(|c| c.password.clone())
-            .or(url_pw.map(Value::Plain)),
+        Password::Keychain { .. } => kept()?,
         Password::Env { name } => Some(Value::Env { env: name.clone() }),
         Password::Dotenv { file, key } => Some(Value::Dotenv {
             dotenv: file.clone(),
             key: key.clone(),
         }),
         Password::Cmd { cmd } => Some(Value::Cmd { cmd: cmd.clone() }),
+        Password::Docker { .. } => bail!("the container's password wasn't read yet"),
     };
     let url = if matches!(draft.password, Password::File) && password.is_none() {
         draft.url.clone()
@@ -356,6 +417,14 @@ pub fn save(cwd: &Path, draft: &Draft, previous: Option<&str>) -> Result<Saved> 
         }
         Password::Keep | Password::Keychain { .. } | Password::File => {
             let kept = old.as_ref().and_then(|o| o.get("password")).cloned();
+            if kept.is_some() {
+                same_target(
+                    old.as_ref()
+                        .and_then(|o| o.get("url"))
+                        .and_then(|u| u.as_str()),
+                    &url,
+                )?;
+            }
             let old_account = kept
                 .as_ref()
                 .and_then(|p| p.get("keychain"))
@@ -381,6 +450,7 @@ pub fn save(cwd: &Path, draft: &Draft, previous: Option<&str>) -> Result<Saved> 
             Some(value(it))
         }
         Password::Cmd { cmd } => Some(reference("cmd", cmd)),
+        Password::Docker { .. } => bail!("the container's password wasn't read yet"),
     };
     if let Some(p) = password {
         t["password"] = p;
@@ -429,18 +499,36 @@ pub fn remove(cwd: &Path, name: &str) -> Result<PathBuf> {
     let global = layer.origin == config::Origin::Global;
     let mut doc = load_doc(&layer.file)?;
     let removed = conns(&mut doc)?.remove(name);
-    if let Some(Value::Keychain { keychain }) = &e.conn.password {
-        keychain_delete(keychain);
-    }
     if removed.is_none() {
         bail!("{name} is not in {}", tilde(&layer.file));
+    }
+    if let Some(Value::Keychain { keychain }) = &e.conn.password
+        && layer
+            .keychain_prefix()
+            .is_some_and(|p| keychain.starts_with(&p))
+    {
+        keychain_delete(keychain);
     }
     save_doc(&layer.file, &doc, global)?;
     Ok(layer.file.clone())
 }
 
-/// Makes existing connection files private (they were created with default permissions).
+/// Makes existing connection files and their folders private (older versions created them with
+/// default permissions).
 pub fn tighten(file: &Path) {
+    let dirs = [
+        Some(config::home()),
+        Some(config::home().join("projects")),
+        file.parent().map(Path::to_path_buf),
+    ];
+    for dir in dirs.iter().flatten() {
+        if let Ok(m) = fs::metadata(dir)
+            && m.is_dir()
+            && m.permissions().mode() & 0o077 != 0
+        {
+            let _ = fs::set_permissions(dir, fs::Permissions::from_mode(0o700));
+        }
+    }
     if let Ok(m) = fs::metadata(file)
         && m.permissions().mode() & 0o077 != 0
     {
@@ -459,6 +547,34 @@ mod tests {
         assert_eq!(u, "postgres://app@localhost:5432/app?sslmode=require");
         assert_eq!(p.as_deref(), Some("p@ss"));
         assert!(split_password("mysql://x").is_err());
+    }
+
+    #[test]
+    fn a_kept_password_never_follows_a_new_host() {
+        let url = "postgres://app@db.stg:5432/app";
+        let old = Some(url);
+        assert!(same_target(old, "postgres://app@db.stg:5432/other?sslmode=require").is_ok());
+        for new in [
+            "postgres://app@evil.example:5432/app",
+            "postgres://app@db.stg:6543/app",
+            "postgres://root@db.stg:5432/app",
+        ] {
+            assert!(same_target(old, new).is_err(), "{new}");
+        }
+        assert!(same_target(None, "postgres://app@db.stg:5432/app").is_err());
+        let existing = Conn {
+            url: Some(Value::Plain(url.into())),
+            password: Some(Value::Keychain {
+                keychain: "x#stg".into(),
+            }),
+            ..Conn::default()
+        };
+        let moved = Draft {
+            url: "postgres://app@evil.example:5432/app".into(),
+            password: Password::Keep,
+            ..Draft::default()
+        };
+        assert!(conn_of(&moved, Some(&existing)).is_err());
     }
 
     #[test]

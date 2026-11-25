@@ -10,6 +10,7 @@ use std::time::Duration;
 #[derive(Debug, Clone)]
 pub struct Found {
     pub name: String,
+    pub container: String,
     pub conn: Conn,
     /// Started by this repo's compose file (or one of its worktrees').
     pub here: bool,
@@ -189,6 +190,42 @@ pub fn running(roots: &[&Path]) -> Detection {
     }
 }
 
+/// The password of a container found earlier, for saving it: only if it still listens where the
+/// saved connection will point, as the same user.
+pub fn password(
+    container: &str,
+    host: &str,
+    port: u16,
+    user: &str,
+) -> Result<Option<String>, String> {
+    let bin = docker_bin().ok_or("docker not found (set DBX_DOCKER_BIN to its path)")?;
+    let list: Json = serde_json::from_str(&docker(
+        &bin,
+        &["inspect", "--type", "container", container],
+    )?)
+    .map_err(|_| "unexpected docker inspect output".to_string())?;
+    let f = list
+        .get(0)
+        .and_then(|c| found(c, &[]))
+        .ok_or_else(|| format!("{container} isn't a database container anymore"))?;
+    let plain = |v: &Option<Value>| match v {
+        Some(Value::Plain(s)) => Some(s.clone()),
+        _ => None,
+    };
+    if plain(&f.conn.host).as_deref() != Some(host)
+        || f.conn.port != Some(port)
+        || plain(&f.conn.user).as_deref() != Some(user)
+    {
+        return Err(format!(
+            "{container} listens elsewhere or as another user: its password is only saved for {}@{}:{}",
+            plain(&f.conn.user).unwrap_or_default(),
+            plain(&f.conn.host).unwrap_or_default(),
+            f.conn.port.unwrap_or_default()
+        ));
+    }
+    Ok(plain(&f.conn.password))
+}
+
 /// Postgres or ClickHouse, from what only a server has: the port its image exposes (5432; 8123
 /// for ClickHouse) or Postgres' `PGDATA`. Apps that connect to one carry `POSTGRES_*`/`CLICKHOUSE_*`
 /// too, and some images are named after one (postgrest), so neither counts; a name only does when
@@ -247,13 +284,17 @@ fn found(c: &Json, roots: &[&Path]) -> Option<Found> {
         }
     };
     let container = c["Name"].as_str()?.trim_start_matches('/').to_string();
+    let inside = |p: &str| {
+        let p = Path::new(p);
+        let p = p.canonicalize().unwrap_or_else(|_| p.to_path_buf());
+        p.is_absolute() && roots.iter().any(|r| p.starts_with(r))
+    };
     let workdir = label("com.docker.compose.project.working_dir");
-    let here = workdir.as_deref().is_some_and(|w| {
-        let w = Path::new(w)
-            .canonicalize()
-            .unwrap_or_else(|_| Path::new(w).to_path_buf());
-        roots.iter().any(|r| w.starts_with(r))
-    });
+    let files = label("com.docker.compose.project.config_files");
+    let here = workdir.as_deref().is_some_and(inside)
+        && files
+            .as_deref()
+            .is_none_or(|f| f.split(',').all(|f| inside(f.trim())));
     let service = label("com.docker.compose.service");
     let name = match (&service, here) {
         (Some(s), true) => s.clone(),
@@ -278,6 +319,7 @@ fn found(c: &Json, roots: &[&Path]) -> Option<Found> {
         .map(|(_, p)| p);
     Some(Found {
         name,
+        container: container.clone(),
         here,
         conn: Conn {
             kind: Some(kind),
@@ -290,6 +332,7 @@ fn found(c: &Json, roots: &[&Path]) -> Option<Found> {
             stage: Some("local".into()),
             note: Some(note),
             unreachable,
+            container: Some(container),
             ..Conn::default()
         },
     })
@@ -355,7 +398,8 @@ mod tests {
             ],
             json!({ "5432/tcp": [{ "HostIp": "0.0.0.0", "HostPort": "5433" }] }),
             json!({ "com.docker.compose.service": "db", "com.docker.compose.project": "proj",
-                    "com.docker.compose.project.working_dir": "/src/proj" }),
+                    "com.docker.compose.project.working_dir": "/src/proj",
+                    "com.docker.compose.project.config_files": "/src/proj/compose.yaml" }),
         );
         let f = found(&c, &[Path::new("/src/proj")]).unwrap();
         assert_eq!((f.name.as_str(), f.here), ("db", true));
@@ -363,6 +407,10 @@ mod tests {
         assert_eq!(f.conn.port, Some(5433));
         assert_eq!(f.conn.password, Some(Value::Plain("pw".into())));
         assert_eq!(f.conn.database, Some(Value::Plain("shop".into())));
+        let mut stray = c.clone();
+        stray["Config"]["Labels"]["com.docker.compose.project.config_files"] =
+            json!("/src/proj/compose.yaml,/tmp/override.yaml");
+        assert!(!found(&stray, &[Path::new("/src/proj")]).unwrap().here);
         let elsewhere = found(&c, &[Path::new("/src/other")]).unwrap();
         assert_eq!(
             (elsewhere.name.as_str(), elsewhere.here),
@@ -400,6 +448,7 @@ mod tests {
             json!({
                 "com.docker.compose.project": project, "com.docker.compose.service": service,
                 "com.docker.compose.project.working_dir": dir,
+                "com.docker.compose.project.config_files": format!("{dir}/docker/compose.yml"),
             })
         };
         let published = |inner: u16, host: u16| json!({ format!("{inner}/tcp"): [{ "HostIp": "0.0.0.0", "HostPort": host.to_string() }] });

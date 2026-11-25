@@ -111,6 +111,38 @@ pub fn resolve(entry: &Entry, layer: &Layer) -> Result<Resolved> {
     if let Some(why) = &c.unreachable {
         bail!("{}: {why}", entry.name);
     }
+    for v in [&c.url, &c.host, &c.user, &c.password, &c.database]
+        .into_iter()
+        .flatten()
+    {
+        if let Value::Keychain { keychain } = v
+            && !layer
+                .keychain_prefix()
+                .is_some_and(|p| keychain.starts_with(&p))
+        {
+            bail!(
+                "{}: the keychain entry {keychain:?} belongs to another repo; set this connection's password again",
+                entry.name
+            );
+        }
+        if let Value::Dotenv { dotenv, .. } = v
+            && layer.origin != crate::config::Origin::Global
+        {
+            let base = layer
+                .base
+                .canonicalize()
+                .unwrap_or_else(|_| layer.base.clone());
+            let path = common::scope::expand(dotenv, &layer.base);
+            let path = path.canonicalize().unwrap_or(path);
+            if !path.starts_with(&base) {
+                bail!(
+                    "{}: {dotenv} is outside {}; a repo's connections only read .env files inside it",
+                    entry.name,
+                    crate::config::tilde(&base)
+                );
+            }
+        }
+    }
     let read = |v: &Option<Value>| v.as_ref().map(|v| read_value(v, &layer.base)).transpose();
     let mut r = Resolved {
         kind: Kind::Postgres,
