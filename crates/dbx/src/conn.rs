@@ -106,6 +106,9 @@ fn decode(s: &str) -> String {
 
 pub fn resolve(entry: &Entry, layer: &Layer) -> Result<Resolved> {
     let c = &entry.conn;
+    if let Some(why) = &c.unreachable {
+        bail!("{}: {why}", entry.name);
+    }
     let read = |v: &Option<Value>| v.as_ref().map(|v| read_value(v, &layer.base)).transpose();
     let mut r = Resolved {
         kind: Kind::Postgres,

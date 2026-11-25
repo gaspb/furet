@@ -499,6 +499,15 @@ fn list(cwd: &Path, all: bool, json: bool) -> Result<i32> {
             println!();
         }
         println!("{}", c("1", label));
+        if let Some(why) = &s.docker {
+            println!(
+                "  {}",
+                c(
+                    "2",
+                    &format!("(running databases in Docker not listed: {why})")
+                )
+            );
+        }
         if rows.is_empty() {
             println!(
                 "  {}",

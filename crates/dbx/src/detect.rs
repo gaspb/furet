@@ -3,7 +3,7 @@
 
 use crate::config::{Conn, Kind, Value};
 use serde_json::Value as Json;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
@@ -15,31 +15,102 @@ pub struct Found {
     pub here: bool,
 }
 
-/// `docker …` with a deadline, so a stuck daemon can't stall the panel; None when docker isn't there.
-fn docker(args: &[&str]) -> Option<String> {
-    let mut child = Command::new("docker")
+/// What Docker had, and why it couldn't be asked when it couldn't.
+#[derive(Debug, Default)]
+pub struct Detection {
+    pub found: Vec<Found>,
+    pub problem: Option<String>,
+}
+
+/// The docker CLI: on PATH, else where Docker Desktop, Homebrew, OrbStack, Rancher Desktop or
+/// Colima put it (an app started from the Dock or a launcher has a minimal PATH).
+fn docker_bin() -> Option<PathBuf> {
+    if let Some(p) = std::env::var_os("DBX_DOCKER_BIN") {
+        return Some(PathBuf::from(p));
+    }
+    if let Some(p) = std::env::var_os("PATH").and_then(|p| {
+        std::env::split_paths(&p)
+            .map(|d| d.join("docker"))
+            .find(|f| f.is_file())
+    }) {
+        return Some(p);
+    }
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_default();
+    [
+        PathBuf::from("/usr/local/bin/docker"),
+        PathBuf::from("/opt/homebrew/bin/docker"),
+        PathBuf::from("/Applications/Docker.app/Contents/Resources/bin/docker"),
+        home.join(".orbstack/bin/docker"),
+        home.join(".rd/bin/docker"),
+        home.join(".docker/bin/docker"),
+        PathBuf::from("/usr/bin/docker"),
+        PathBuf::from("/snap/bin/docker"),
+    ]
+    .into_iter()
+    .find(|p| p.is_file())
+}
+
+/// `docker …` with a deadline, so a stuck daemon can't stall the panel.
+fn docker(bin: &Path, args: &[&str]) -> Result<String, String> {
+    let mut cmd = Command::new(bin);
+    // Credential helpers and contexts (Docker Desktop, OrbStack…) live next to the CLI.
+    if let (Some(dir), Some(path)) = (bin.parent(), std::env::var_os("PATH")) {
+        let mut dirs: Vec<PathBuf> = std::env::split_paths(&path).collect();
+        dirs.push(dir.to_path_buf());
+        if let Ok(joined) = std::env::join_paths(dirs) {
+            cmd.env("PATH", joined);
+        }
+    }
+    let mut child = cmd
         .args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
+        .stderr(Stdio::piped())
         .spawn()
-        .ok()?;
+        .map_err(|e| format!("cannot run {}: {e}", bin.display()))?;
     let start = std::time::Instant::now();
-    loop {
+    let status = loop {
         match child.try_wait() {
-            Ok(Some(status)) if status.success() => break,
-            Ok(Some(_)) | Err(_) => return None,
+            Ok(Some(status)) => break status,
+            Err(e) => return Err(e.to_string()),
             Ok(None) if start.elapsed() > Duration::from_secs(3) => {
                 let _ = child.kill();
                 let _ = child.wait();
-                return None;
+                return Err("Docker didn't answer within 3 s".into());
             }
             Ok(None) => std::thread::sleep(Duration::from_millis(20)),
         }
+    };
+    let read = |r: Option<&mut dyn std::io::Read>| {
+        let mut s = String::new();
+        if let Some(r) = r {
+            let _ = r.read_to_string(&mut s);
+        }
+        s
+    };
+    let out = read(child.stdout.as_mut().map(|r| r as &mut dyn std::io::Read));
+    if !status.success() {
+        let err = read(child.stderr.as_mut().map(|r| r as &mut dyn std::io::Read));
+        let err = err
+            .lines()
+            .find(|l| !l.trim().is_empty())
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        return Err(
+            if err.contains("Cannot connect to the Docker daemon")
+                || err.contains("Is the docker daemon running")
+                || err.contains("failed to connect to the docker API")
+            {
+                "Docker isn't running".into()
+            } else {
+                err
+            },
+        );
     }
-    let mut out = String::new();
-    std::io::Read::read_to_string(&mut child.stdout.take()?, &mut out).ok()?;
-    Some(out)
+    Ok(out)
 }
 
 pub fn enabled() -> bool {
@@ -50,45 +121,70 @@ pub fn enabled() -> bool {
 }
 
 /// The running Postgres and ClickHouse containers; `roots` are the folders that count as this repo.
-pub fn running(roots: &[&Path]) -> Vec<Found> {
+pub fn running(roots: &[&Path]) -> Detection {
     if !enabled() {
-        return Vec::new();
+        return Detection::default();
     }
-    let Some(ids) = docker(&["ps", "-q"]) else {
-        return Vec::new();
+    let Some(bin) = docker_bin() else {
+        return Detection {
+            found: Vec::new(),
+            problem: Some("docker not found (set DBX_DOCKER_BIN to its path)".into()),
+        };
+    };
+    let ids = match docker(&bin, &["ps", "-q"]) {
+        Ok(ids) => ids,
+        Err(e) => {
+            return Detection {
+                found: Vec::new(),
+                problem: Some(e),
+            };
+        }
     };
     let ids: Vec<&str> = ids.split_whitespace().collect();
     if ids.is_empty() {
-        return Vec::new();
+        return Detection::default();
     }
     let mut args = vec!["inspect"];
     args.extend(&ids);
-    let Some(text) = docker(&args) else {
-        return Vec::new();
+    let list = match docker(&bin, &args).map(|t| serde_json::from_str::<Json>(&t)) {
+        Ok(Ok(Json::Array(list))) => list,
+        Ok(_) => {
+            return Detection {
+                found: Vec::new(),
+                problem: Some("unexpected docker inspect output".into()),
+            };
+        }
+        Err(e) => {
+            return Detection {
+                found: Vec::new(),
+                problem: Some(e),
+            };
+        }
     };
-    let Ok(Json::Array(list)) = serde_json::from_str::<Json>(&text) else {
-        return Vec::new();
-    };
-    let mut out: Vec<Found> = list.iter().filter_map(|c| found(c, roots)).collect();
-    out.sort_by(|a, b| b.here.cmp(&a.here).then(a.name.cmp(&b.name)));
-    out
+    let mut found: Vec<Found> = list.iter().filter_map(|c| self::found(c, roots)).collect();
+    found.sort_by(|a, b| b.here.cmp(&a.here).then(a.name.cmp(&b.name)));
+    Detection {
+        found,
+        problem: None,
+    }
 }
 
-fn kind_of(image: &str) -> Option<Kind> {
-    let image = image.rsplit('/').next().unwrap_or(image).to_lowercase();
-    if [
-        "postgres",
-        "postgis",
-        "timescaledb",
-        "pgvector",
-        "supabase/postgres",
-        "pgduckdb",
-    ]
-    .iter()
-    .any(|k| image.contains(k))
+/// Postgres or ClickHouse, from what only a server has: the port its image exposes (5432; 8123
+/// for ClickHouse) or Postgres' `PGDATA`. Apps that connect to one carry `POSTGRES_*`/`CLICKHOUSE_*`
+/// too, and some images are named after one (postgrest), so neither counts; a name only does when
+/// the image exposes no ports at all.
+fn kind_of(c: &Json, env: &[(&str, &str)]) -> Option<Kind> {
+    let image = c["Config"]["Image"].as_str().unwrap_or("").to_lowercase();
+    let ports = c["Config"]["ExposedPorts"].as_object();
+    let exposes = |p: &str| ports.is_some_and(|m| m.contains_key(p));
+    let none_exposed = ports.is_none_or(|m| m.is_empty());
+    let named = |names: &[&str]| none_exposed && names.iter().any(|n| image.contains(n));
+    if exposes("5432/tcp")
+        || env.iter().any(|(k, _)| *k == "PGDATA")
+        || named(&["postgres", "postgis", "timescale"])
     {
         Some(Kind::Postgres)
-    } else if image.contains("clickhouse") {
+    } else if exposes("8123/tcp") || named(&["clickhouse"]) {
         Some(Kind::Clickhouse)
     } else {
         None
@@ -97,12 +193,15 @@ fn kind_of(image: &str) -> Option<Kind> {
 
 fn found(c: &Json, roots: &[&Path]) -> Option<Found> {
     let image = c["Config"]["Image"].as_str()?;
-    let kind = kind_of(image)?;
     let env: Vec<(&str, &str)> = c["Config"]["Env"]
-        .as_array()?
-        .iter()
-        .filter_map(|e| e.as_str()?.split_once('='))
-        .collect();
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .filter_map(|e| e.as_str()?.split_once('='))
+                .collect()
+        })
+        .unwrap_or_default();
+    let kind = kind_of(c, &env)?;
     let var = |k: &str| {
         env.iter()
             .find(|(n, _)| *n == k)
@@ -127,7 +226,6 @@ fn found(c: &Json, roots: &[&Path]) -> Option<Found> {
             )
         }
     };
-    let (host, port) = address(c, inner)?;
     let container = c["Name"].as_str()?.trim_start_matches('/').to_string();
     let workdir = label("com.docker.compose.project.working_dir");
     let here = workdir.as_deref().is_some_and(|w| {
@@ -142,11 +240,17 @@ fn found(c: &Json, roots: &[&Path]) -> Option<Found> {
         _ => container.clone(),
     };
     let project = label("com.docker.compose.project");
-    let note = match (&project, here) {
+    let mut note = match (&project, here) {
         (Some(p), true) => format!("docker · {image} · this repo's compose ({p})"),
         (Some(p), false) => format!("docker · {image} · compose project {p}"),
         (None, _) => format!("docker · {image}"),
     };
+    let address = address(c, inner);
+    let unreachable = address.is_none().then(|| format!("port {inner} isn't published, so it can't be reached from this machine: publish it (ports: [\"{inner}:{inner}\"])"));
+    if address.is_none() {
+        note.push_str(&format!(" · port {inner} not published"));
+    }
+    let (host, port) = address.unwrap_or_else(|| ("localhost".into(), inner));
     Some(Found {
         name,
         here,
@@ -159,6 +263,7 @@ fn found(c: &Json, roots: &[&Path]) -> Option<Found> {
             database: Some(Value::Plain(database)),
             stage: Some("local".into()),
             note: Some(note),
+            unreachable,
             ..Conn::default()
         },
     })
@@ -201,9 +306,13 @@ mod tests {
     use serde_json::json;
 
     fn container(image: &str, env: &[&str], ports: Json, labels: Json) -> Json {
+        let exposed: serde_json::Map<String, Json> = ports
+            .as_object()
+            .map(|m| m.keys().map(|k| (k.clone(), json!({}))).collect())
+            .unwrap_or_default();
         json!({
             "Name": "/proj-db-1",
-            "Config": { "Image": image, "Env": env, "Labels": labels },
+            "Config": { "Image": image, "Env": env, "Labels": labels, "ExposedPorts": exposed },
             "NetworkSettings": { "Ports": ports, "Networks": { "bridge": { "IPAddress": "172.17.0.5" } } },
         })
     }
@@ -255,5 +364,93 @@ mod tests {
         .unwrap();
         assert_eq!(pg.conn.user, Some(Value::Plain("postgres".into())));
         assert_eq!(pg.conn.password, None);
+    }
+
+    /// The containers from a real `docker ps`: two compose projects, a plain one, Redpanda next to them.
+    #[test]
+    fn meteroid_setup() {
+        let repo = "/src/meteroid-ent2";
+        let compose = |project: &str, service: &str, dir: &str| {
+            json!({
+                "com.docker.compose.project": project, "com.docker.compose.service": service,
+                "com.docker.compose.project.working_dir": dir,
+            })
+        };
+        let published = |inner: u16, host: u16| json!({ format!("{inner}/tcp"): [{ "HostIp": "0.0.0.0", "HostPort": host.to_string() }] });
+        let mut db = container(
+            "ghcr.io/meteroid-oss/meteroid-postgres:18.3-standard",
+            &["POSTGRES_PASSWORD=secret"],
+            published(5432, 15432),
+            compose("meteroid-ent2", "meteroid-db", repo),
+        );
+        db["Name"] = json!("/meteroid-ent2-meteroid-db-1");
+        let f = found(&db, &[Path::new(repo)]).unwrap();
+        assert_eq!(
+            (f.name.as_str(), f.here, f.conn.port),
+            ("meteroid-db", true, Some(15432))
+        );
+        let mut ch = container(
+            "clickhouse/clickhouse-server:25.6.2-alpine",
+            &[],
+            json!({
+                "8123/tcp": [{ "HostIp": "0.0.0.0", "HostPort": "18123" }],
+                "9000/tcp": [{ "HostIp": "0.0.0.0", "HostPort": "19000" }],
+                "9009/tcp": [{ "HostIp": "0.0.0.0", "HostPort": "19009" }],
+            }),
+            compose("meteroid-ent2", "clickhouse", repo),
+        );
+        ch["Name"] = json!("/meteroid-ent2-clickhouse-1");
+        assert_eq!(
+            found(&ch, &[Path::new(repo)]).unwrap().conn.port,
+            Some(19000)
+        );
+        let mut test_pg = container(
+            "ghcr.io/meteroid-oss/meteroid-postgres:18.3-standard",
+            &[],
+            published(5432, 55432),
+            json!({}),
+        );
+        test_pg["Name"] = json!("/meteroid-test-pg");
+        assert_eq!(
+            found(&test_pg, &[Path::new(repo)]).unwrap().name,
+            "meteroid-test-pg"
+        );
+        let redpanda = container(
+            "docker.redpanda.com/redpandadata/console:v2.3.1",
+            &[],
+            published(8080, 18085),
+            json!({}),
+        );
+        assert!(found(&redpanda, &[]).is_none());
+    }
+
+    #[test]
+    fn recognises_custom_images_by_port_or_env_and_flags_unpublished_ones() {
+        let mut custom = container("acme/db:1", &[], json!({}), json!({}));
+        custom["Config"]["ExposedPorts"] = json!({ "5432/tcp": {} });
+        let f = found(&custom, &[]).unwrap();
+        assert_eq!(f.conn.kind, Some(Kind::Postgres));
+        assert_eq!(f.conn.unreachable.is_some(), !cfg!(target_os = "linux"));
+        let mut app = container(
+            "meteroid/api:latest",
+            &[
+                "POSTGRES_HOST=meteroid-db",
+                "POSTGRES_PASSWORD=x",
+                "CLICKHOUSE_URL=http://clickhouse:8123",
+            ],
+            json!({}),
+            json!({}),
+        );
+        app["Config"]["ExposedPorts"] = json!({ "8080/tcp": {} });
+        assert!(
+            found(&app, &[]).is_none(),
+            "an app that connects to a database isn't one"
+        );
+        let mut postgrest = container("postgrest/postgrest:v12", &[], json!({}), json!({}));
+        postgrest["Config"]["ExposedPorts"] = json!({ "3000/tcp": {} });
+        assert!(found(&postgrest, &[]).is_none());
+        let mut ch = container("acme/analytics:2", &[], json!({}), json!({}));
+        ch["Config"]["ExposedPorts"] = json!({ "8123/tcp": {}, "9000/tcp": {} });
+        assert_eq!(found(&ch, &[]).unwrap().conn.kind, Some(Kind::Clickhouse));
     }
 }

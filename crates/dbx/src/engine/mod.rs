@@ -150,6 +150,7 @@ impl Engine {
             "root": scope.root,
             "file": crate::config::project_file(&scope.root),
             "connections": rows,
+            "docker": scope.docker,
         }))
     }
 
