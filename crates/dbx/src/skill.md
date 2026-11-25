@@ -15,9 +15,10 @@ worktrees). Use it instead of asking for credentials or reading them from files.
 
 Rules:
 - Connections whose stage isn't local/dev/test are read-only (Postgres sessions start with
-  `default_transaction_read_only`, ClickHouse with `readonly=1`). Don't try to get around it.
-  `-w` allows writes; on prod it asks the user to type the name, so you can't use it there. Ask the
-  user before writing anywhere but local.
+  `default_transaction_read_only`, ClickHouse with `readonly=1`). It's a guard against mistakes, not a
+  permission system, so it's on you not to get around it (no `set default_transaction_read_only`,
+  `begin read write`…). `-w` allows writes; on prod it asks for the connection's name: that question is the
+  user's, never type it yourself. Ask the user before writing anywhere but local.
 - Don't run `dbx` with no arguments or `dbx <name>`: both open interactive clients.
 - To add a connection: `dbx add <name> <url> [--stage stg] [--tunnel '<cmd>']` (a password in the URL goes to the
   keychain, not the file). Prefer secrets by

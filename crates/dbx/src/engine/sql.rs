@@ -161,6 +161,26 @@ pub fn pageable(stmt: &str) -> bool {
         && !lower.contains(" for share")
 }
 
+/// Would turn a read-only Postgres session writable (`set default_transaction_read_only`,
+/// `begin read write`, `reset all`, dynamic SQL…): refused while it's read-only.
+pub fn lifts_readonly(stmt: &str) -> bool {
+    let lower = strip_comments(stmt).to_lowercase();
+    let flat = lower.split_whitespace().collect::<Vec<_>>().join(" ");
+    [
+        "transaction_read_only",
+        "read write",
+        "session characteristics",
+        "set_config",
+        "reset all",
+        "discard all",
+    ]
+    .iter()
+    .any(|w| flat.contains(w))
+        || statements(stmt)
+            .iter()
+            .any(|&(a, b)| verb(&stmt[a..b]) == "do")
+}
+
 fn contains_word(s: &str, w: &str) -> bool {
     s.split(|c: char| !c.is_alphanumeric() && c != '_')
         .any(|t| t == w)
@@ -246,6 +266,23 @@ mod tests {
         assert!(!pageable("select * from t for update"));
         assert!(!pageable("update t set a = 1"));
         assert!(!pageable("explain select 1"));
+    }
+
+    #[test]
+    fn spots_what_would_lift_read_only() {
+        for sql in [
+            "SET default_transaction_read_only = off",
+            "set session characteristics as transaction read write",
+            "begin; set transaction\n  READ   WRITE; insert into t values (1)",
+            "start transaction isolation level serializable, read write",
+            "reset all",
+            "select set_config('default_transaction_' || 'read_only', 'off', false)",
+            "do $$ begin execute 'x'; end $$",
+        ] {
+            assert!(lifts_readonly(sql), "{sql}");
+        }
+        assert!(!lifts_readonly("select * from users; begin read only"));
+        assert!(!lifts_readonly("show transaction isolation level"));
     }
 
     #[test]

@@ -125,6 +125,23 @@ pub fn resolve(entry: &Entry, layer: &Layer) -> Result<Resolved> {
                 entry.name
             );
         }
+        if let Value::Dotenv { dotenv, .. } = v
+            && layer.origin != crate::config::Origin::Global
+        {
+            let base = layer
+                .base
+                .canonicalize()
+                .unwrap_or_else(|_| layer.base.clone());
+            let path = common::scope::expand(dotenv, &layer.base);
+            let path = path.canonicalize().unwrap_or(path);
+            if !path.starts_with(&base) {
+                bail!(
+                    "{}: {dotenv} is outside {}; a repo's connections only read .env files inside it",
+                    entry.name,
+                    crate::config::tilde(&base)
+                );
+            }
+        }
     }
     let read = |v: &Option<Value>| v.as_ref().map(|v| read_value(v, &layer.base)).transpose();
     let mut r = Resolved {

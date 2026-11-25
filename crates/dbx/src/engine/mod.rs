@@ -224,12 +224,19 @@ impl Engine {
     }
 
     /// Connects with a draft (tunnel included) without saving it.
-    pub fn test(&self, req: DraftReq) -> Result<Value, Fail> {
+    pub fn test(&self, mut req: DraftReq) -> Result<Value, Fail> {
+        store::from_docker(&mut req.draft).map_err(|e| Fail(400, format!("{e:#}")))?;
         let scope = Scope::load(&req.cwd)?;
+        let target = if req.draft.global {
+            crate::config::Origin::Global
+        } else {
+            crate::config::Origin::Project
+        };
         let existing = req
             .previous
             .as_deref()
             .and_then(|p| scope.get(p).ok())
+            .filter(|e| scope.layer(e).origin == target)
             .map(|e| e.conn.clone());
         let conn = store::conn_of(&req.draft, existing.as_ref())
             .map_err(|e| Fail(400, format!("{e:#}")))?;
@@ -238,13 +245,13 @@ impl Engine {
             layer: 0,
             conn,
         };
-        let layer = &scope.layers[0];
+        let layer = scope
+            .layers
+            .iter()
+            .find(|l| l.origin == target)
+            .unwrap_or(&scope.layers[0]);
         let r = conn::resolve(&entry, layer).map_err(|e| Fail(400, format!("{e:#}")))?;
-        let file = if req.draft.global {
-            crate::config::global_file()
-        } else {
-            layer.file.clone()
-        };
+        let file = layer.file.clone();
         let owner = format!(
             "{}#{}",
             crate::config::tilde(&file),
@@ -260,7 +267,8 @@ impl Engine {
         }
     }
 
-    pub fn save(&self, req: DraftReq) -> Result<Value, Fail> {
+    pub fn save(&self, mut req: DraftReq) -> Result<Value, Fail> {
+        store::from_docker(&mut req.draft).map_err(|e| Fail(400, format!("{e:#}")))?;
         let saved = store::save(&req.cwd, &req.draft, req.previous.as_deref())
             .map_err(|e| Fail(400, format!("{e:#}")))?;
         Ok(serde_json::to_value(saved)?)
@@ -436,6 +444,16 @@ impl Engine {
                 None => return fail(400, "nothing to run"),
             }
         };
+        let readonly = s.readonly.load(Ordering::SeqCst);
+        if readonly
+            && matches!(s.backend, Backend::Pg { .. })
+            && sql::lifts_readonly(&sql[range.0..range.1])
+        {
+            return fail(
+                409,
+                "that would turn read-only off: switch the session to read-write instead (prod asks to confirm)",
+            );
+        }
         let limit = req.limit.unwrap_or(500).clamp(1, 10_000);
         let out = match &s.backend {
             Backend::Pg { pg, .. } => pg
@@ -447,7 +465,22 @@ impl Engine {
         if out.error.as_ref().is_some_and(|e| e.closed) {
             self.sessions.lock().unwrap().remove(id);
         }
-        Ok(serde_json::to_value(out)?)
+        let mut v = serde_json::to_value(out)?;
+        if let Backend::Pg { pg, .. } = &s.backend {
+            let mut pg = pg.lock().unwrap();
+            match pg.is_readonly() {
+                Some(false) if readonly => {
+                    let _ = pg.set_readonly(true);
+                    if v["error"].is_null() {
+                        v["error"] = json!({ "message": "that turned read-only off; dbx turned it back on" });
+                    }
+                }
+                Some(now) => s.readonly.store(now, Ordering::SeqCst),
+                None => {}
+            }
+        }
+        v["readonly"] = json!(s.readonly.load(Ordering::SeqCst));
+        Ok(v)
     }
 
     pub fn cancel(&self, root: &std::path::Path, id: &str) -> Result<Value, Fail> {
@@ -487,6 +520,12 @@ impl Engine {
         let s = self.session(root, id)?;
         if req.statements.is_empty() {
             return fail(400, "nothing to apply");
+        }
+        if s.readonly.load(Ordering::SeqCst) {
+            return fail(
+                409,
+                "the session is read-only: switch it to read-write to apply changes",
+            );
         }
         let Backend::Pg { pg, .. } = &s.backend else {
             return fail(
