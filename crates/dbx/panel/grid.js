@@ -90,9 +90,10 @@ function columnAt(set, size, x, scrollX) {
  * works the column out from where the press was). `onSort(col, cx)`: a header was clicked.
  * `pending`: Map "row:col" → new value; `deleted`: Set of rows marked for deletion.
  * `onMenu(row, col, event, cx)` / `onHeaderMenu(col, event, cx)`: a right-click on a cell or a header.
+ * `onPick(row, col, double, cx, follow)`: `follow` when Ctrl/Cmd was held. `tip(row, col)`: a hover card's text.
  */
 export function grid(id, set, opts) {
-  const { t, font, sel, offset = 0, sort, onSort, onPick, onMenu, onHeaderMenu, pending, deleted, scroll, zoom = 1, focus, onKey } = opts;
+  const { t, font, sel, offset = 0, sort, onSort, onPick, onMenu, onHeaderMenu, pending, deleted, scroll, zoom = 1, focus, onKey, tip } = opts;
   const order = opts.order ?? set.rows.map((_, i) => i);
   const size = font.font_size;
   const w = widths(set, size), total = GUTTER + w.reduce((a, b) => a + b, 0) + 16;
@@ -118,7 +119,7 @@ export function grid(id, set, opts) {
       .when(gone, (e) => e.bg(tint(t.ansi1, "22")))
       .when(!gone && onRow, (e) => e.bg(tint(t.accent, "18")))
       .when(!gone && !onRow && k % 2 === 1, (e) => e.bg(tint(t.raised, "66")))
-      .when(!gone && !onRow, (e) => e.hover((s) => s.bg(tint(t.hover, "aa"))))
+      .when(!gone && !onRow, (e) => e.hover((s) => s.bg(t.hover)))
       .child(div().w(GUTTER).flex_none().px(6).text_right().text_color(gone ? t.ansi1 : t.dim).text_size(Math.max(9, size - 2))
         .child(gone ? "✕" : String(offset + i + 1)))
       .children(r.map((loaded, j) => {
@@ -128,6 +129,7 @@ export function grid(id, set, opts) {
           .when(edited, (e) => e.bg(tint(t.ansi3, "33")))
           .when(on, (e) => e.border_1().border_color(t.accent))
           .when(gone, (e) => e.text_color(t.dim))
+          .when(Boolean(set.columns[j].refs && tip), (e) => { const text = tip(i, j); return text ? e.tooltip(text) : e; })
           .child(((look) => div().truncate().text_color(gone ? t.dim : look.color)
             .when(Boolean(look.italic), (e) => e.italic()).when(Boolean(look.underline) && !gone, (e) => e.underline())
             .when(keyCols.has(set.columns[j].name), (e) => e.font_semibold()).child(look.text))(shown(t, kinds[j], v, Boolean(set.columns[j].refs))));
@@ -137,7 +139,8 @@ export function grid(id, set, opts) {
     .when(Boolean(focus), (e) => e.track_focus(focus).on_key_down((ev, cx) => onKey?.(ev, cx)))
     .on_mouse_down("left", (e) => {
       const x = (e.local_position?.x ?? 0) / zoom, y = (e.local_position?.y ?? 0) / zoom;
-      presses.set(id, { col: y > h + 8 ? columnAt(set, size, x, scroll?.offset?.().x ?? 0) : null, double: e.click_count >= 2 });
+      presses.set(id, { col: y > h + 8 ? columnAt(set, size, x, scroll?.offset?.().x ?? 0) : null, double: e.click_count >= 2,
+        follow: Boolean(e.modifiers?.platform || e.modifiers?.control) });
     })
     .child(div().id(`${id}-x`).size_full().overflow_x_scrollbar().when(Boolean(scroll), (e) => e.track_scroll(scroll))
       .child(v_flex().w_full().min_w(total).h_full()
@@ -145,7 +148,10 @@ export function grid(id, set, opts) {
         .child(div().flex_1().min_h(0)
           .child(v_virtual_list(`${id}-rows`, order.length, h, (k) => String(order[k]),
             (range) => Array.from({ length: range.end - range.start }, (_, n) => row(range.start + n)))
-            .size_full().on_item_click((key, cx) => onPick(Number(key), presses.get(id)?.col ?? null, Boolean(presses.get(id)?.double), cx))
+            .size_full().on_item_click((key, cx) => {
+              const p = presses.get(id);
+              onPick(Number(key), p?.col ?? null, Boolean(p?.double), cx, Boolean(p?.follow));
+            })
             .when(Boolean(onMenu), (e) => e.on_item_secondary_click((key, ev, cx) =>
               onMenu(Number(key), columnAt(set, size, (ev.local_position?.x ?? 0) / zoom, 0), ev, cx)))))))
     .child(Scrollbar.vertical(`${id}-rows`).viewport_from_layout().absolute().inset_0());

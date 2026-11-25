@@ -12,6 +12,7 @@ const set = (tab) => tab.results?.[0];
 
 /** Why this table view can't be edited, or null. */
 export function blocked(tab) {
+  if (tab.step) return "these are followed rows: Esc goes back to the table";
   if (!tab.info) return "loading the table's structure…";
   if (tab.info.dialect === "clickhouse") return "ClickHouse changes rows with asynchronous mutations (ALTER TABLE … UPDATE), so they aren't edited here";
   if (tab.info.kind !== "r" && tab.info.kind !== "p") return "views can't be edited here";

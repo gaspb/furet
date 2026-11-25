@@ -5,13 +5,14 @@ import { v_flex, h_flex, InputState, Input, Editor, EditorState, Scrollbar, Scro
 import { spaces, focused, theme, settings, props, nextCommand, run } from "herdr";
 import { platform } from "process";
 import { call, missing, INSTALL } from "./api.js";
-import { grid, record, tint, displayOrder } from "./grid.js";
+import { grid, tint, displayOrder } from "./grid.js";
 import { blocked, changes, startEdit, commitEdit, cancelEdit, toggleDelete, editBars } from "./edit.js";
 import { complete, lineCol, quoteIdent, csv, json, literal } from "./sql.js";
 import { openForm, formBody, removeConnection, editFile } from "./form.js";
 import { openMenu, menuLayer, menuKey } from "./menu.js";
 import { helpBody } from "./help.js";
-import { peek, cellRef, closePeek, peekPanel } from "./peek.js";
+import { go, back, resetTrail, cellTarget, selected, prefetch, cellSummary, trailBar, stepLabel } from "./nav.js";
+import { inspector } from "./inspector.js";
 import * as lineOps from "./lines.js";
 
 const LIMITS = [100, 500, 2000];
@@ -277,11 +278,13 @@ export default class Dbx extends View {
     const rel = `${quoteIdent(tab.schema)}.${quoteIdent(tab.table)}`;
     const sql = `select * from ${rel}${tab.where.trim() ? ` where ${tab.where}` : ""}${tab.order.trim() ? ` order by ${tab.order}` : ""}`;
     tab.running = true; tab.error = null;
+    resetTrail(tab);
     cx.spawn(async (cx) => {
       try {
         const out = await this.withSession(this.source(tab.conn), tab.conn,
           (id) => this.api("POST", `/sessions/${id}/query`, { sql, cursor: 0, limit: tab.limit, offset: tab.offset }));
         tab.results = out.results; tab.error = out.error; tab.elapsed = out.elapsed_ms; tab.sel = null;
+        prefetch(this, tab, cx);
       } catch (e) { tab.error = { message: String(e.message ?? e) }; }
       finally { tab.running = false; cx.notify(); }
     });
@@ -292,7 +295,7 @@ export default class Dbx extends View {
   sortBy(tab, col, cx) {
     const dir = tab.sort?.col !== col ? "asc" : tab.sort.dir === "asc" ? "desc" : null;
     tab.sort = dir ? { col, dir } : null;
-    if (tab.kind === "table") {
+    if (tab.kind === "table" && !tab.step) {
       if (changes(tab)) { this.flash("Submit or revert the pending changes first", cx); return; }
       const name = tab.results?.[0]?.columns[col]?.name;
       tab.order = dir && name ? `${quoteIdent(name)} ${dir}` : "";
@@ -317,12 +320,13 @@ export default class Dbx extends View {
       const set = tab.results?.[tab.picked ?? 0], key = `${tab.sel.row}:${tab.sel.col}`;
       const v = tab.pending?.has(key) ? tab.pending.get(key) : set?.rows[tab.sel.row]?.[tab.sel.col];
       if (tab.sel.col !== null && v !== undefined) this.copy(v ?? "", "the cell", cx);
-    } else if (k === "space") {
-      const r = cellRef(tab);
-      if (tab.peek?.length) closePeek(tab, cx);
-      else if (r) peek(this, tab, r.refs, r.value, cx, { fresh: true });
-      else this.flash("Space previews a foreign key's row: this column isn't one", cx);
-    } else if (k === "escape" && tab.peek?.length) closePeek(tab, cx);
+    } else if (k === "cmd-enter" || k === "ctrl-enter") {
+      const target = cellTarget(tab);
+      if (target) go(this, tab, target, cx);
+      else this.flash("⌘/Ctrl+Enter follows a foreign key: this column isn't one", cx);
+    } else if (k === "r") this.referrersMenu(tab, cx);
+    else if (k === "space") { tab.inspector = tab.inspector === false; cx.notify(); }
+    else if (k === "escape" && tab.trail?.length) back(tab, cx);
     else if (k === "escape") this.focusZone(tab.kind === "console" ? "editor" : "where", cx);
     else if (["up", "down", "left", "right"].includes(k)) {
       const [dr, dc] = { up: [-1, 0], down: [1, 0], left: [0, -1], right: [0, 1] }[k];
@@ -331,11 +335,13 @@ export default class Dbx extends View {
     cx.stop_propagation();
   }
 
-  pick(tab, row, col, double, cx) {
-    if (tab.sel?.row !== row) tab.peek = null;
+  pick(tab, row, col, double, cx, follow = false) {
     tab.sel = { row, col };
     this.gridHandle.focus();
     this.zone = "grid";
+    const target = follow ? cellTarget(tab) : null;
+    if (target) { go(this, tab, target, cx); return; }
+    selected(this, tab, cx);
     if (double && tab.kind === "table") startEdit(this, tab, cx);
     cx.notify();
   }
@@ -344,10 +350,11 @@ export default class Dbx extends View {
   moveSel(tab, dr, dc, cx) {
     const set = tab.results?.[tab.picked ?? 0];
     if (!set || !set.rows.length) return;
-    const order = tab.kind === "console" ? displayOrder(set, tab.sort) : set.rows.map((_, i) => i);
+    const order = tab.kind === "console" || tab.step ? displayOrder(set, tab.sort) : set.rows.map((_, i) => i);
     const cur = tab.sel ?? { row: order[0], col: 0 };
     const k = Math.max(0, Math.min(order.length - 1, order.indexOf(cur.row) + dr));
     tab.sel = { row: order[k], col: Math.max(0, Math.min(set.columns.length - 1, (cur.col ?? 0) + dc)) };
+    if (dr) selected(this, tab, cx);
     cx.notify();
   }
 
@@ -366,6 +373,7 @@ export default class Dbx extends View {
     if (tab.running || !tab.editor) return;
     const sql = tab.editor.value(), sel = tab.editor.selected_range();
     tab.running = true; tab.error = null; tab.startedAt = Date.now(); tab.suggestions = [];
+    resetTrail(tab);
     const body = { sql, all, limit: tab.limit, offset, cursor: sel.start };
     if (sel.end !== sel.start) body.selection = [sel.start, sel.end];
     tab.lastBody = body;
@@ -374,6 +382,7 @@ export default class Dbx extends View {
         const out = await this.withSession(tab, tab.conn, (id) => this.api("POST", `/sessions/${id}/query`, body));
         tab.results = out.results; tab.error = out.error; tab.elapsed = out.elapsed_ms; tab.paged = out.paged; tab.disconnected = false;
         tab.offset = offset; tab.picked = Math.max(0, out.results.length - 1); tab.sel = null; tab.sort = null;
+        prefetch(this, tab, cx);
         if (out.error?.position !== undefined && out.error?.position !== null) {
           tab.editor.set_selected_range({ start: out.error.position, end: out.error.position });
         }
@@ -384,6 +393,7 @@ export default class Dbx extends View {
   }
 
   page(tab, delta, cx) {
+    if (tab.step) return;
     if (tab.kind === "table") { tab.offset = Math.max(0, tab.offset + delta * tab.limit); this.loadTable(tab, cx); return; }
     if (!tab.lastBody || tab.running) return;
     const offset = Math.max(0, (tab.offset ?? 0) + delta * tab.limit);
@@ -827,10 +837,14 @@ export default class Dbx extends View {
       this.loadTable(tab, cx);
     };
     const fk = set.columns[col].refs;
+    const referrers = set._referrers?.get(row);
     openMenu(this, e, [
-      fk && v !== null && { label: `Preview the ${fk.table} row`, hint: "Space", run: (cx) => peek(this, tab, fk, v, cx, { fresh: true }) },
+      fk && v !== null && { label: `Go to ${stepLabel({ ...fk, value: v })}`, hint: "⌘↵", run: (cx) => go(this, tab, { ...fk, value: v }, cx) },
       fk && v !== null && { label: `Open ${fk.table} at this row`, run: (cx) => this.openTable(tab.conn, fk.schema, fk.table, "table", cx, `${quoteIdent(fk.column)} = ${literal(v)}`) },
-      fk && v !== null && "-",
+      ...(Array.isArray(referrers) ? referrers.filter((x) => x.count).map((x) => ({
+        label: `${x.table}.${x.column} · ${x.count}${x.more ? "+" : ""} row${x.count === 1 ? "" : "s"}`, hint: "r",
+        run: (cx) => go(this, tab, { ...x, reverse: true }, cx) })) : []),
+      (fk && v !== null) || (Array.isArray(referrers) && referrers.some((x) => x.count)) ? "-" : null,
       { label: "Copy value", hint: "⌘C", run: (cx) => this.copy(v ?? "", "the value", cx) },
       { label: "Copy column name", run: (cx) => this.copy(name, "the column name", cx) },
       { label: "Copy row as JSON", run: (cx) => this.copy(JSON.stringify(record, null, 2), "the row as JSON", cx) },
@@ -1004,31 +1018,70 @@ export default class Dbx extends View {
           .bg(i === tab.picked ? t.selected : t.background).hover((x) => x.bg(t.hover))
           .on_click((_e, cx) => { tab.picked = i; tab.sel = null; tab.sort = null; cx.notify(); })
           .child(s.columns.length ? `Result ${i + 1}` : `Statement ${i + 1}`)))))
-      .when(set.columns.length > 0, (e) => e.child(grid(`dbx-grid-${tab.id}`, set, {
+      .when(set.columns.length > 0, (e) => e.child(this.gridWithInspector(tab, set, t, font, offset)))
+      .child(this.statusBar(tab, set, t, offset, rowsShown, status));
+  }
+
+  /** The grid, and the selected row's inspector beside it (Space hides it). */
+  gridWithInspector(tab, set, t, font, offset) {
+    const g = grid(`dbx-grid-${tab.id}`, set, {
         t, font, offset, sel: tab.sel, sort: tab.sort, scroll: tab.scroll, zoom: settings().zoom ?? 1,
-        order: tab.kind === "console" ? displayOrder(set, tab.sort) : undefined,
+        order: tab.kind === "console" || tab.step ? displayOrder(set, tab.sort) : undefined,
+        tip: (row, col) => cellSummary(tab, row, col),
         pending: tab.pending, deleted: tab.deleted, pk: tab.info?.primary_key,
         onSort: (col, cx) => this.sortBy(tab, col, cx),
         onPick: (row, col, double, cx) => this.pick(tab, row, col, double, cx),
         onMenu: (row, col, e, cx) => this.cellMenu(tab, row, col, e, cx),
         onHeaderMenu: (col, e, cx) => this.headerMenu(tab, col, e, cx),
         focus: this.gridHandle, onKey: (e, cx) => this.gridKey(tab, e, cx),
-      })))
-      .when(Boolean(tab.peek?.length), (e) => e.child(peekPanel(this, tab, t, font)))
-      .when(!tab.peek?.length && Boolean(tab.sel) && Boolean(set.rows[tab.sel?.row]), (e) => e.child(record(set, tab.sel.row, { t, font, pending: tab.pending,
-        onCopy: (v, cx) => this.copy(v, "value", cx), onRef: (refs, v, cx) => peek(this, tab, refs, v, cx, { fresh: true }) })))
-      .child(h_flex().h(32).flex_none().px(10).gap(8).items_center().border_t(1).border_color(t.border).text_size(11.5)
+      });
+    const showing = tab.inspector !== false && Boolean(set.rows[tab.sel?.row]);
+    const area = div().flex_1().min_h(0).flex().flex_col()
+      .when(Boolean(tab.trail?.length), (e) => e.child(trailBar(this, tab, t)))
+      .when(Boolean(tab.navigating), (e) => e.child(div().px(12).py(2).text_size(11).text_color(t.dim).child("Following…")));
+    if (!showing) return area.child(g);
+    return area.child(h_resizable(`dbx-insp-split-${tab.id}`).flex_1().min_h(0)
+      .child(resizable_panel().child(v_flex().size_full().min_w(0).child(g)))
+      .child(resizable_panel().size(330).size_range(220, 900).child(inspector(this, tab, t, font))));
+  }
+
+  statusBar(tab, set, t, offset, rowsShown, status) {
+    return h_flex().h(32).flex_none().px(10).gap(8).items_center().border_t(1).border_color(t.border).text_size(11.5)
         .child(div().text_color(t.muted).child(status))
         .child(div().text_color(t.dim).child(`${tab.elapsed ?? 0} ms`))
-        .when(tab.kind === "table" && Boolean(tab.info), (e) => e.child(div().truncate().text_color(t.dim)
+        .when(tab.kind === "table" && Boolean(tab.info) && !tab.step, (e) => e.child(div().truncate().text_color(t.dim)
           .child(blocked(tab) ?? "double-click a cell to edit · Del marks a row")))
+        .when(Boolean(tab.step), (e) => e.child(div().truncate().text_color(t.dim).child("followed rows · Esc goes back")))
         .child(div().flex_1())
-        .when(set.columns.length > 0 && (tab.paged !== false || tab.kind === "table"), (e) => e
+        .when(set.columns.length > 0 && !tab.step && (tab.paged !== false || tab.kind === "table"), (e) => e
           .child(this.button(`dbx-prev-${tab.id}`, "‹ Prev", (cx) => this.page(tab, -1, cx), { t, disabled: !offset || tab.running }))
           .child(this.button(`dbx-next-${tab.id}`, "Next ›", (cx) => this.page(tab, 1, cx), { t, disabled: !set.more || tab.running })))
         .when(set.columns.length > 0, (e) => e
           .child(this.button(`dbx-csv-${tab.id}`, "CSV", (cx) => this.copy(csv(set.columns, set.rows), `${rowsShown} rows as CSV`, cx), { t }))
-          .child(this.button(`dbx-json-${tab.id}`, "JSON", (cx) => this.copy(json(set.columns, set.rows), `${rowsShown} rows as JSON`, cx), { t }))));
+          .child(this.button(`dbx-json-${tab.id}`, "JSON", (cx) => this.copy(json(set.columns, set.rows), `${rowsShown} rows as JSON`, cx), { t })));
+  }
+
+  /** The rows pointing at the selected row, as a menu (`r`). */
+  referrersMenu(tab, cx) {
+    const set = tab.results?.[tab.picked ?? 0], list = set?._referrers?.get(tab.sel?.row);
+    const o = this.origin ?? { x: 0, y: 0, width: 800, height: 600 };
+    const at = { position: { x: o.x + o.width / 2, y: o.y + o.height / 3 } };
+    if (!Array.isArray(list)) { this.flash(list === null ? "Still looking…" : "Select a row first", cx); return; }
+    const items = list.filter((x) => x.count).map((x) => ({ label: `${x.table}.${x.column} · ${x.count}${x.more ? "+" : ""} row${x.count === 1 ? "" : "s"}`,
+      run: (cx) => go(this, tab, { ...x, reverse: true }, cx) }));
+    if (!items.length) { this.flash("Nothing points at this row", cx); return; }
+    openMenu(this, at, items, cx);
+  }
+
+  /** A followed step as SQL: at the end of a console's editor, or in a new console. */
+  stepToSql(tab, step, cx) {
+    const sql = `${step.sql};`;
+    if (tab.kind !== "console") { this.newConsole(tab.conn, cx, sql); return; }
+    const text = tab.editor.value().replace(/\s*$/, "\n\n");
+    tab.editor.set_value(text + sql);
+    tab.editor.set_selected_range({ start: text.length, end: text.length + sql.length });
+    tab.editor.focus();
+    cx.notify();
   }
 
   consoleBody(tab, t) {
@@ -1134,9 +1187,9 @@ export default class Dbx extends View {
           .child(seg(`dbx-struct-${tab.id}`, "Structure", tab.view === "structure", (cx) => { tab.view = "structure"; cx.notify(); })))
         .child(this.button(`dbx-reload-${tab.id}`, "↻", (cx) => this.loadTable(tab, cx), { t })))
       .when(tab.view === "data", (e) => e
-        .child(h_flex().h(40).flex_none().px(10).gap(8).items_center().border_b(1).border_color(t.border)
+        .when(!tab.step, (e) => e.child(h_flex().h(40).flex_none().px(10).gap(8).items_center().border_b(1).border_color(t.border)
           .child(div().text_size(11).text_color(t.dim).child("WHERE")).child(field(tab.whereInput, "fill").key_context("DbxWhere"))
-          .child(div().text_size(11).text_color(t.dim).child("ORDER BY")).child(field(tab.orderInput, 170).key_context("DbxOrder")))
+          .child(div().text_size(11).text_color(t.dim).child("ORDER BY")).child(field(tab.orderInput, 170).key_context("DbxOrder"))))
         .when(Boolean(tab.confirming), (e) => e.child(h_flex().h(40).flex_none().px(10).gap(8).items_center().bg(tint(t.ansi1, "14")).border_b(1).border_color(t.border)
           .child(div().text_size(12).text_color(t.ansi1).child(`${tab.conn} is prod. Type its name and Enter to allow writes:`))
           .child(h_flex().h(28).w(180).px(8).items_center().rounded(6).border_1().border_color(t.ansi1).child(Input.new(this.confirmInput).flex_1().h_full().text_size(12)))

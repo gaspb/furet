@@ -126,13 +126,19 @@ fn current(info: &Info) -> bool {
     running(info).is_some_and(|(v, b)| v == VERSION && b == build_id())
 }
 
+/// Stops the running engine and waits until it has let go of its lock (closing its sessions and
+/// tunnels), so another can start right after.
 pub fn stop() -> bool {
-    read_info().is_some_and(|info| {
+    let asked = read_info().is_some_and(|info| {
         call(&info, "POST", "/shutdown").is_some_and(|(status, _)| status == 200)
-    })
+    });
+    let deadline = std::time::Instant::now() + Duration::from_secs(15);
+    while asked && engine_running() && std::time::Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    asked
 }
 
-/// Prints the running server's address and token, starting one in the background if needed.
 /// Whether a dbx engine holds the lock: only your processes can open it (0700 folder), so a
 /// `serve.json` without a holder is stale, whatever answers on its port.
 fn engine_running() -> bool {
@@ -154,6 +160,7 @@ fn engine_running() -> bool {
     !free
 }
 
+/// The running server's address and token, starting one in the background if needed.
 pub fn ensure() -> Result<Info> {
     if !engine_running() {
         let _ = fs::remove_file(info_file());
@@ -420,6 +427,12 @@ fn respond(engine: &Engine, info: &Info, mut req: Request) -> bool {
                         .map_err(|e| Fail(400, e.to_string()))
                 })
                 .and_then(|l| root().and_then(|r| engine.lookup(&r, id, l))),
+            (Method::Post, ["sessions", id, "referrers"]) => parse(&body)
+                .and_then(|v| {
+                    serde_json::from_value::<super::ReferrersReq>(v)
+                        .map_err(|e| Fail(400, e.to_string()))
+                })
+                .and_then(|q| root().and_then(|r| engine.referrers(&r, id, q))),
             (Method::Get, ["sessions", id, "catalog"]) => {
                 root().and_then(|r| engine.catalog(&r, id))
             }

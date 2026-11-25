@@ -182,4 +182,5 @@ idle for 30 minutes. Postgres and ClickHouse.
 | `POST /sessions/:id/cancel` · `/mode` `{write, confirm?}` · `DELETE /sessions/:id` | |
 | `GET /sessions/:id/catalog` · `/table?schema=&name=` | schemas, tables and columns; one table's columns, indexes, constraints (ClickHouse: databases; engine, keys, skipping indexes and `create`) |
 | `POST /sessions/:id/apply` `{statements}` | row edits in one transaction (Postgres) |
-| `POST /sessions/:id/lookup` `{schema, table, column, value}` | the row a foreign key value points at (Postgres); result columns that are foreign keys carry `refs: {schema, table, column}` |
+| `POST /sessions/:id/lookup` `{schema, table, column, value \| values, limit?}` | the rows where `column = value` (or `in values`), Postgres. Result columns carry `origin` (the table column they copy) and, for a foreign key, `refs` (where it points) |
+| `POST /sessions/:id/referrers` `{schema, table, row}` | the foreign keys pointing at that row, each with how many rows point there (counted up to 1000) |
