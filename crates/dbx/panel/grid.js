@@ -5,6 +5,28 @@ import { v_flex, h_flex, Scrollbar, v_virtual_list } from "gpui-base";
 
 // Postgres' type names, and ClickHouse's (UInt64, Nullable(Float64), Decimal(12, 2)…).
 const NUMERIC = /^(int[248]|float[48]|numeric|oid|money|smallint|integer|bigint|real|double precision)|^(Nullable\(|LowCardinality\()*(U?Int\d+|Float\d+|BFloat16|Decimal\d*)\b/;
+const KINDS = [
+  ["bool", /^bool$|^(Nullable\()?Bool\b/],
+  ["number", NUMERIC],
+  ["time", /^(timestamp|timestamptz|date|time|timetz|interval)\b|^(Nullable\()?(Date|DateTime)/],
+  ["json", /^jsonb?$|^(Nullable\()?(JSON|Object)\b/],
+  ["uuid", /^uuid$|^(Nullable\()?UUID\b/],
+];
+/** What a column holds, for colouring its values: number, time, json, uuid, bool, or text. */
+export const kindOf = (c) => (KINDS.find(([, re]) => re.test(c.type ?? "")) ?? ["text"])[0];
+
+/** How a value looks in its column: colour, and `t`/`f` spelled out. */
+function shown(t, kind, v, isRef) {
+  if (v === null) return { text: "null", color: t.dim, italic: true };
+  if (kind === "bool") {
+    const yes = v === "t" || v === "true" || v === "1";
+    return { text: yes ? "true" : "false", color: yes ? t.ansi2 : t.ansi1 };
+  }
+  if (isRef) return { text: oneLine(v), color: t.accent, underline: true };
+  const color = { number: t.ansi4, time: t.ansi6, json: t.ansi5, uuid: t.muted }[kind] ?? t.foreground;
+  return { text: oneLine(v), color };
+}
+
 export const rowHeight = (size) => Math.ceil(size * 1.75);
 const charWidth = (size) => size * 0.62;
 const GUTTER = 52;
@@ -22,7 +44,8 @@ export function tint(color, alpha) {
 function widths(set, size) {
   if (set._widths?.size === size) return set._widths.list;
   const list = set.columns.map((c, i) => {
-    let longest = Math.max(c.name.length + 2, (c.type ?? "").length + 2);
+    const typeLine = (c.type ?? "").length + (c.refs ? c.refs.table.length + 5 : 0) + 5;
+    let longest = Math.max(c.name.length + 2, typeLine);
     for (const r of set.rows.slice(0, 200)) longest = Math.max(longest, Math.min(60, (r[i] ?? "null").length));
     return Math.round(Math.min(420, Math.max(64, longest * charWidth(size) + 22)));
   });
@@ -74,6 +97,8 @@ export function grid(id, set, opts) {
   const size = font.font_size;
   const w = widths(set, size), total = GUTTER + w.reduce((a, b) => a + b, 0) + 16;
   const numeric = set.columns.map((c) => NUMERIC.test(c.type ?? ""));
+  const kinds = set.columns.map(kindOf);
+  const keyCols = new Set(opts.pk ?? []);
   const h = rowHeight(size);
   const header = h_flex().h(h + 8).flex_none().border_b(1).border_color(t.border).bg(t.raised)
     .child(div().w(GUTTER).flex_none())
@@ -82,8 +107,10 @@ export function grid(id, set, opts) {
       return v_flex().id(`${id}-h${i}`).w(w[i]).flex_none().px(8).justify_center().border_l(1).border_color(t.border)
         .when(Boolean(onSort), (e) => e.cursor_pointer().hover((s) => s.bg(t.hover)).on_click((_e, cx) => onSort(i, cx)))
         .when(Boolean(onHeaderMenu), (e) => e.on_mouse_down("right", (ev, cx) => onHeaderMenu(i, ev, cx)))
-        .child(div().truncate().font_semibold().text_color(sort?.col === i ? t.accent : t.foreground).child(c.name + arrow))
-        .when(Boolean(c.type), (e) => e.child(div().truncate().text_size(Math.max(9, size - 3)).text_color(t.dim).child(c.type)));
+        .child(div().truncate().font_semibold().text_color(sort?.col === i ? t.accent : t.foreground)
+          .child(c.name + arrow))
+        .when(Boolean(c.type), (e) => e.child(div().truncate().text_size(Math.max(9, size - 3)).text_color(t.dim)
+          .child([c.type, keyCols.has(c.name) && "pk", c.refs && `→ ${c.refs.table}`].filter(Boolean).join(" · "))));
     }));
   const row = (k) => {
     const i = order[k], r = set.rows[i], onRow = sel?.row === i, gone = deleted?.has(i);
@@ -91,6 +118,7 @@ export function grid(id, set, opts) {
       .when(gone, (e) => e.bg(tint(t.ansi1, "22")))
       .when(!gone && onRow, (e) => e.bg(tint(t.accent, "18")))
       .when(!gone && !onRow && k % 2 === 1, (e) => e.bg(tint(t.raised, "66")))
+      .when(!gone && !onRow, (e) => e.hover((s) => s.bg(tint(t.hover, "aa"))))
       .child(div().w(GUTTER).flex_none().px(6).text_right().text_color(gone ? t.ansi1 : t.dim).text_size(Math.max(9, size - 2))
         .child(gone ? "✕" : String(offset + i + 1)))
       .children(r.map((loaded, j) => {
@@ -100,7 +128,9 @@ export function grid(id, set, opts) {
           .when(edited, (e) => e.bg(tint(t.ansi3, "33")))
           .when(on, (e) => e.border_1().border_color(t.accent))
           .when(gone, (e) => e.text_color(t.dim))
-          .child(div().truncate().when(v === null, (e) => e.text_color(t.dim)).child(v === null ? "null" : oneLine(v)));
+          .child(((look) => div().truncate().text_color(gone ? t.dim : look.color)
+            .when(Boolean(look.italic), (e) => e.italic()).when(Boolean(look.underline) && !gone, (e) => e.underline())
+            .when(keyCols.has(set.columns[j].name), (e) => e.font_semibold()).child(look.text))(shown(t, kinds[j], v, Boolean(set.columns[j].refs))));
       }));
   };
   return div().id(`${id}-wrap`).flex_1().min_h(0).relative().font_family(font.font_family).text_size(size)
@@ -122,7 +152,8 @@ export function grid(id, set, opts) {
 }
 
 /** The selected row as name → value, for reading long values and copying one. */
-export function record(set, index, { t, font, onCopy, pending }) {
+/** `onRef(refs, value, cx)`: a foreign key field's ↗ was clicked. */
+export function record(set, index, { t, font, onCopy, onRef, pending }) {
   const r = set.rows[index];
   if (!r) return null;
   return v_flex().id("dbx-record").max_h(180).flex_none().overflow_y_scroll().border_t(1).border_color(t.border)
@@ -132,6 +163,9 @@ export function record(set, index, { t, font, onCopy, pending }) {
       return h_flex().id(`dbx-rec-${i}`).px(10).py(1).gap(10).items_start().rounded(4).cursor_pointer()
         .hover((s) => s.bg(t.hover)).on_click((_e, cx) => onCopy(v ?? "", cx))
         .child(div().w(160).flex_none().truncate().text_color(t.dim).child(c.name))
-        .child(div().flex_1().min_w(0).text_color(v === null ? t.dim : t.foreground).child(v === null ? "null" : v.slice(0, 4000)));
+        .child(div().flex_1().min_w(0).text_color(v === null ? t.dim : t.foreground).child(v === null ? "null" : v.slice(0, 4000)))
+        .when(Boolean(c.refs && onRef && v !== null), (e) => e.child(div().id(`dbx-rec-ref-${i}`).flex_none().px(6).rounded(4)
+          .text_size(11).text_color(t.accent).hover((s) => s.bg(t.selected))
+          .on_click((_e, cx) => { cx.stop_propagation(); onRef(c.refs, v, cx); }).child(`↗ ${c.refs.table}`)));
     }));
 }

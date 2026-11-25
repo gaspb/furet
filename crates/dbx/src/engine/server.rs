@@ -414,6 +414,12 @@ fn respond(engine: &Engine, info: &Info, mut req: Request) -> bool {
                         .map_err(|e| Fail(400, e.to_string()))
                 })
                 .and_then(|a| root().and_then(|r| engine.apply(&r, id, a))),
+            (Method::Post, ["sessions", id, "lookup"]) => parse(&body)
+                .and_then(|v| {
+                    serde_json::from_value::<super::LookupReq>(v)
+                        .map_err(|e| Fail(400, e.to_string()))
+                })
+                .and_then(|l| root().and_then(|r| engine.lookup(&r, id, l))),
             (Method::Get, ["sessions", id, "catalog"]) => {
                 root().and_then(|r| engine.catalog(&r, id))
             }

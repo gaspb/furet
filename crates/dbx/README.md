@@ -182,3 +182,4 @@ idle for 30 minutes. Postgres and ClickHouse.
 | `POST /sessions/:id/cancel` · `/mode` `{write, confirm?}` · `DELETE /sessions/:id` | |
 | `GET /sessions/:id/catalog` · `/table?schema=&name=` | schemas, tables and columns; one table's columns, indexes, constraints (ClickHouse: databases; engine, keys, skipping indexes and `create`) |
 | `POST /sessions/:id/apply` `{statements}` | row edits in one transaction (Postgres) |
+| `POST /sessions/:id/lookup` `{schema, table, column, value}` | the row a foreign key value points at (Postgres); result columns that are foreign keys carry `refs: {schema, table, column}` |

@@ -8,6 +8,7 @@ use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, Server
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
 use rustls::{ClientConfig, DigitallySignedStruct, SignatureScheme};
 use serde::Serialize;
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio_postgres_rustls::MakeRustlsConnect;
@@ -22,6 +23,8 @@ pub struct Pg {
     cancel: CancelToken,
     tls: MakeRustlsConnect,
     pub server_version: String,
+    /// Single-column foreign keys by (table oid, column number), read once per catalog.
+    fks: Option<HashMap<(u32, i16), Ref>>,
 }
 
 #[derive(Serialize, Debug)]
@@ -29,6 +32,17 @@ pub struct Column {
     pub name: String,
     #[serde(rename = "type")]
     pub ty: Option<String>,
+    /// The row this column's value points at, when it comes from a foreign key column.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub refs: Option<Ref>,
+}
+
+/// A referenced column: `select * from schema.table where column = <value>` finds the row.
+#[derive(Serialize, Debug, Clone)]
+pub struct Ref {
+    pub schema: String,
+    pub table: String,
+    pub column: String,
 }
 
 #[derive(Serialize, Debug, Default)]
@@ -166,6 +180,7 @@ impl Pg {
             cancel,
             tls,
             server_version,
+            fks: None,
         })
     }
 
@@ -296,12 +311,17 @@ impl Pg {
             limit + 1
         );
         let prepared = self.client.prepare(&wrapped).ok()?;
+        let fks = self.foreign_keys();
         let columns = prepared
             .columns()
             .iter()
             .map(|c| Column {
                 name: c.name().into(),
                 ty: Some(c.type_().name().into()),
+                refs: c
+                    .table_oid()
+                    .zip(c.column_id())
+                    .and_then(|k| fks.get(&k).cloned()),
             })
             .collect();
         drop(prepared);
@@ -315,7 +335,56 @@ impl Pg {
         }))
     }
 
+    /// The database's single-column foreign keys (read once, and again with the catalog).
+    fn foreign_keys(&mut self) -> HashMap<(u32, i16), Ref> {
+        if let Some(fks) = &self.fks {
+            return fks.clone();
+        }
+        let rows = self.client.query(
+            "select c.conrelid, c.conkey[1], n.nspname::text, r.relname::text, a.attname::text
+             from pg_constraint c
+             join pg_class r on r.oid = c.confrelid
+             join pg_namespace n on n.oid = r.relnamespace
+             join pg_attribute a on a.attrelid = c.confrelid and a.attnum = c.confkey[1]
+             where c.contype = 'f' and cardinality(c.conkey) = 1",
+            &[],
+        );
+        let fks: HashMap<(u32, i16), Ref> = rows
+            .map(|rows| {
+                rows.iter()
+                    .map(|r| {
+                        let key = (r.get::<_, u32>(0), r.get::<_, i16>(1));
+                        let target = Ref {
+                            schema: r.get(2),
+                            table: r.get(3),
+                            column: r.get(4),
+                        };
+                        (key, target)
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        self.fks = Some(fks.clone());
+        fks
+    }
+
+    /// The row `table.column = value` points at, with its own columns' references.
+    pub fn lookup(&mut self, target: &Ref, value: &str) -> Result<ResultSet> {
+        let stmt = format!(
+            "select * from {}.{} where {} = {}",
+            quote_ident(&target.schema),
+            quote_ident(&target.table),
+            quote_ident(&target.column),
+            quote_literal(value)
+        );
+        match self.page(&stmt, 5, 0) {
+            Some(r) => Ok(r?),
+            None => anyhow::bail!("cannot look up {}.{}", target.schema, target.table),
+        }
+    }
+
     pub fn catalog(&mut self) -> Result<serde_json::Value> {
+        self.fks = None;
         let schemas: Vec<String> = self
             .client
             .query(
@@ -453,6 +522,16 @@ impl Pg {
     }
 }
 
+/// A string literal that means the same whatever `standard_conforming_strings` says.
+pub fn quote_literal(s: &str) -> String {
+    let quoted = s.replace('\'', "''");
+    if s.contains('\\') {
+        format!("E'{}'", quoted.replace('\\', "\\\\"))
+    } else {
+        format!("'{quoted}'")
+    }
+}
+
 pub fn quote_ident(s: &str) -> String {
     format!("\"{}\"", s.replace('"', "\"\""))
 }
@@ -470,6 +549,7 @@ fn collect(messages: Vec<SimpleQueryMessage>, limit: usize) -> Vec<ResultSet> {
                         .map(|c| Column {
                             name: c.name().into(),
                             ty: None,
+                            refs: None,
                         })
                         .collect(),
                     ..Default::default()

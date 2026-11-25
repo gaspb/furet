@@ -160,6 +160,14 @@ pub struct ApplyReq {
 }
 
 #[derive(Deserialize)]
+pub struct LookupReq {
+    pub schema: String,
+    pub table: String,
+    pub column: String,
+    pub value: String,
+}
+
+#[derive(Deserialize)]
 pub struct ModeReq {
     pub write: bool,
     pub confirm: Option<String>,
@@ -554,6 +562,25 @@ impl Engine {
             Backend::Pg { pg, .. } => pg.lock().unwrap().table(schema, name)?,
             Backend::Ch(ch) => ch.table(schema, name)?,
         })
+    }
+
+    /// The row a foreign key value points at (Postgres): its columns carry their own references.
+    pub fn lookup(&self, root: &std::path::Path, id: &str, req: LookupReq) -> Result<Value, Fail> {
+        let s = self.session(root, id)?;
+        let Backend::Pg { pg, .. } = &s.backend else {
+            return fail(400, "ClickHouse has no foreign keys");
+        };
+        let target = pg::Ref {
+            schema: req.schema,
+            table: req.table,
+            column: req.column,
+        };
+        let set = pg
+            .lock()
+            .unwrap()
+            .lookup(&target, &req.value)
+            .map_err(|e| Fail(400, format!("{e:#}")))?;
+        Ok(serde_json::to_value(set)?)
     }
 
     /// Closes sessions idle for longer than `SESSION_IDLE` or whose connection dropped.

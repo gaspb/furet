@@ -526,12 +526,14 @@ fn read_result(
                     .map(|v| Column {
                         name: unescape(v).unwrap_or_default(),
                         ty: types.next().and_then(unescape),
+                        refs: None,
                     })
                     .collect();
             } else {
                 first.columns = vec![Column {
                     name: format.unwrap_or("result").to_string(),
                     ty: None,
+                    refs: None,
                 }];
                 first
                     .rows
