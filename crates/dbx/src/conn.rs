@@ -111,6 +111,21 @@ pub fn resolve(entry: &Entry, layer: &Layer) -> Result<Resolved> {
     if let Some(why) = &c.unreachable {
         bail!("{}: {why}", entry.name);
     }
+    for v in [&c.url, &c.host, &c.user, &c.password, &c.database]
+        .into_iter()
+        .flatten()
+    {
+        if let Value::Keychain { keychain } = v
+            && !layer
+                .keychain_prefix()
+                .is_some_and(|p| keychain.starts_with(&p))
+        {
+            bail!(
+                "{}: the keychain entry {keychain:?} belongs to another repo; set this connection's password again",
+                entry.name
+            );
+        }
+    }
     let read = |v: &Option<Value>| v.as_ref().map(|v| read_value(v, &layer.base)).transpose();
     let mut r = Resolved {
         kind: Kind::Postgres,

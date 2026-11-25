@@ -139,9 +139,36 @@ pub fn project_file(root: &Path) -> PathBuf {
     home().join("projects").join(scope::encode(root)).join(FILE)
 }
 
+/// Moves a project's folder from its old, ambiguous name, if it's really this project's.
+fn migrate(root: &Path) {
+    let new = home().join("projects").join(scope::encode(root));
+    let old = home().join("projects").join(scope::legacy_encode(root));
+    let ours = fs::read_to_string(old.join(ROOT_FILE)).is_ok_and(|r| Path::new(r.trim()) == root);
+    if !new.exists() && ours {
+        let _ = fs::rename(&old, &new);
+    }
+}
+
+/// The project's connections file, after checking its folder is really this project's.
+fn checked_project_file(root: &Path) -> Result<PathBuf> {
+    migrate(root);
+    let file = project_file(root);
+    if let Ok(recorded) = fs::read_to_string(file.with_file_name(ROOT_FILE))
+        && Path::new(recorded.trim()) != root
+    {
+        anyhow::bail!(
+            "{} belongs to {}, not {}: not using it",
+            file.parent().unwrap().display(),
+            recorded.trim(),
+            root.display()
+        );
+    }
+    Ok(file)
+}
+
 /// Creates a project's directory, recording which repo it is for.
 pub fn ensure_project_dir(root: &Path) -> Result<PathBuf> {
-    let file = project_file(root);
+    let file = checked_project_file(root)?;
     let dir = file.parent().unwrap();
     fs::create_dir_all(dir).with_context(|| format!("cannot create {}", dir.display()))?;
     for d in [home(), home().join("projects")] {
@@ -184,6 +211,16 @@ pub struct Layer {
 }
 
 impl Layer {
+    /// The keychain accounts this file's connections may use: `global#…` or `<repo>#…`. A
+    /// reference to another repo's account (copied by hand, say) is refused rather than read.
+    pub fn keychain_prefix(&self) -> Option<String> {
+        match (self.origin, &self.root) {
+            (Origin::Global, _) => Some("global#".into()),
+            (Origin::Project | Origin::Include, Some(root)) => Some(format!("{}#", tilde(root))),
+            _ => None,
+        }
+    }
+
     pub fn label(&self) -> String {
         match (self.origin, &self.root) {
             (Origin::Global, _) => "global".into(),
@@ -252,7 +289,7 @@ impl Scope {
         if !seen.insert(root.to_path_buf()) {
             return Ok(());
         }
-        let file = project_file(root);
+        let file = checked_project_file(root)?;
         crate::store::tighten(&file);
         let content = File::read(&file)?;
         let includes: Vec<PathBuf> = content
@@ -363,10 +400,13 @@ impl Scope {
 }
 
 pub fn tilde(p: &Path) -> String {
-    let s = p.to_string_lossy();
     match std::env::var("HOME") {
-        Ok(h) if !h.is_empty() && s.starts_with(&h) => format!("~{}", &s[h.len()..]),
-        _ => s.into_owned(),
+        Ok(h) if !h.is_empty() => match p.strip_prefix(&h) {
+            Ok(rest) if rest.as_os_str().is_empty() => "~".into(),
+            Ok(rest) => format!("~/{}", rest.display()),
+            Err(_) => p.display().to_string(),
+        },
+        _ => p.display().to_string(),
     }
 }
 

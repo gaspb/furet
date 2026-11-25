@@ -3,42 +3,86 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-fn git(cwd: &Path, args: &[&str]) -> Option<PathBuf> {
-    let out = Command::new("git")
-        .arg("-C")
-        .arg(cwd)
-        .args(args)
-        .output()
-        .ok()?;
-    if !out.status.success() {
-        return None;
+/// `git -C cwd …` ignoring any GIT_DIR, GIT_WORK_TREE… inherited from the caller, which would
+/// otherwise make a folder pass for another repo.
+fn git_output(cwd: &Path, args: &[&str]) -> Option<String> {
+    let mut cmd = Command::new("git");
+    for (k, _) in std::env::vars_os() {
+        if k.to_string_lossy().starts_with("GIT_") {
+            cmd.env_remove(k);
+        }
     }
-    let s = String::from_utf8(out.stdout).ok()?;
+    let out = cmd.arg("-C").arg(cwd).args(args).output().ok()?;
+    out.status
+        .success()
+        .then(|| String::from_utf8(out.stdout).ok())
+        .flatten()
+}
+
+fn git(cwd: &Path, args: &[&str]) -> Option<PathBuf> {
+    let s = git_output(cwd, args)?;
     let s = s.trim();
     (!s.is_empty()).then(|| PathBuf::from(s))
 }
 
-/// The main checkout of `dir`'s git repo, so clones' linked worktrees share it; outside git, `dir`.
+/// The main checkout of `dir`'s git repo, so its linked worktrees share it; outside git, `dir`.
+/// A folder only counts as part of a repo if it's inside the main checkout or one of the
+/// worktrees that repo lists: a `.git` file pointing somewhere doesn't make it so.
 pub fn project_root(dir: &Path) -> PathBuf {
+    let tree = worktree_root(dir);
     if let Some(common) = git(
         dir,
         &["rev-parse", "--path-format=absolute", "--git-common-dir"],
     ) && common.file_name().is_some_and(|n| n == ".git")
-        && let Some(parent) = common.parent()
+        && let Some(main) = common.parent()
     {
-        return parent.to_path_buf();
+        let main = main.canonicalize().unwrap_or_else(|_| main.to_path_buf());
+        let listed = || {
+            git_output(&main, &["worktree", "list", "--porcelain"]).is_some_and(|out| {
+                out.lines()
+                    .filter_map(|l| l.strip_prefix("worktree "))
+                    .any(|w| Path::new(w).canonicalize().is_ok_and(|w| w == tree))
+            })
+        };
+        if tree.starts_with(&main) || listed() {
+            return main;
+        }
     }
-    worktree_root(dir)
+    tree
 }
 
 /// The top of the working tree `dir` is in (a linked worktree stays itself); outside git, `dir`.
 pub fn worktree_root(dir: &Path) -> PathBuf {
-    git(dir, &["rev-parse", "--show-toplevel"])
-        .unwrap_or_else(|| dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf()))
+    let top = git(dir, &["rev-parse", "--show-toplevel"]).unwrap_or_else(|| dir.to_path_buf());
+    top.canonicalize().unwrap_or(top)
 }
 
-/// A path as a single directory name: `/home/me/api` → `-home-me-api`.
+/// A path as a single directory name, distinct for every path: a readable tail and a hash of the
+/// whole path (`/home/me/src/api` → `src-api-1f3b9c2d4e5a6b7c`).
 pub fn encode(root: &Path) -> String {
+    let full = root.to_string_lossy();
+    let mut hash: u64 = 0xcbf29ce484222325;
+    for b in full.as_bytes() {
+        hash = (hash ^ *b as u64).wrapping_mul(0x100000001b3);
+    }
+    let parts: Vec<&str> = full.split('/').filter(|p| !p.is_empty()).collect();
+    let tail = parts[parts.len().saturating_sub(2)..].join("-");
+    let tail: String = tail
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '.' || c == '_' {
+                c
+            } else {
+                '-'
+            }
+        })
+        .take(40)
+        .collect();
+    format!("{tail}-{hash:016x}")
+}
+
+/// How `encode` named folders before it was made unambiguous (`/home/me/api` → `-home-me-api`).
+pub fn legacy_encode(root: &Path) -> String {
     root.to_string_lossy()
         .chars()
         .map(|c| {
@@ -92,8 +136,22 @@ mod tests {
     use super::*;
 
     #[test]
-    fn encodes_paths_as_one_dir_name() {
-        assert_eq!(encode(Path::new("/home/me/my api")), "-home-me-my-api");
+    fn encodes_paths_as_one_dir_name_without_collisions() {
+        assert_eq!(
+            legacy_encode(Path::new("/home/me/my api")),
+            "-home-me-my-api"
+        );
+        let names: Vec<String> = ["/x/a-b", "/x/a/b", "/x/a b", "/x/a_b"]
+            .iter()
+            .map(|p| encode(Path::new(p)))
+            .collect();
+        assert!(names[0].starts_with("x-a-b-") && names[3].starts_with("x-a_b-"));
+        for (i, a) in names.iter().enumerate() {
+            for b in &names[i + 1..] {
+                assert_ne!(a, b);
+            }
+        }
+        assert_eq!(encode(Path::new("/x/a/b")), encode(Path::new("/x/a/b")));
     }
 
     #[test]

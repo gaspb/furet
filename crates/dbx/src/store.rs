@@ -429,11 +429,15 @@ pub fn remove(cwd: &Path, name: &str) -> Result<PathBuf> {
     let global = layer.origin == config::Origin::Global;
     let mut doc = load_doc(&layer.file)?;
     let removed = conns(&mut doc)?.remove(name);
-    if let Some(Value::Keychain { keychain }) = &e.conn.password {
-        keychain_delete(keychain);
-    }
     if removed.is_none() {
         bail!("{name} is not in {}", tilde(&layer.file));
+    }
+    if let Some(Value::Keychain { keychain }) = &e.conn.password
+        && layer
+            .keychain_prefix()
+            .is_some_and(|p| keychain.starts_with(&p))
+    {
+        keychain_delete(keychain);
     }
     save_doc(&layer.file, &doc, global)?;
     Ok(layer.file.clone())
