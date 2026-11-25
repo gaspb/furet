@@ -4,6 +4,22 @@ Database connections tied to the repo you're in, stored outside it. Secrets are 
 connection opens (env, `.env`, any command), port-forwards start and stop on their own, and
 anything that isn't local opens read-only.
 
+## Quick start
+
+```sh
+cargo install --locked --git https://github.com/gaspb/tui-tools dbx
+cd ~/src/my-api
+dbx add stg 'postgres://app:secret@localhost:15432/app' --stage stg \
+  --tunnel 'kubectl -n stg port-forward svc/postgres 15432:5432'
+dbx stg                 # tunnel up, psql read-only; the tunnel stops when you quit
+```
+
+The password goes to the OS keychain, not the file. Databases running in Docker show up on their own.
+Clients are your own: `psql`, `clickhouse-client`, `kubectl` for tunnels. On Linux the keychain needs a
+Secret Service (GNOME Keyring, KWallet, KeePassXC). For the herdr panel, see [herdr](#herdr).
+
+## Commands
+
 ```
 dbx                     pick a connection (type to filter); back to the list when the client exits
 dbx <name> [-w]         open it in its client (psql, clickhouse-client, or yours)
@@ -55,8 +71,10 @@ stage = "prod"
   saved without it, and the password goes to the OS keychain (macOS Keychain, or the Secret Service on Linux:
   GNOME Keyring, KWallet, KeePassXC). The files and their folders are readable only by you. Fields override what the URL says.
   Relative paths and commands start from the current worktree (from the included repo, for its connections).
-- `tunnel` runs before connecting, unless the port already answers (a tunnel from another pane is reused),
-  and is stopped when the client exits. In the picker it stays up until you quit.
+- `tunnel` runs before connecting and stops when the client exits (in the picker, when you quit). A tunnel
+  belongs to the connection that started it: opening the same connection from another pane or repo reuses it.
+  If the port is held by another connection's tunnel, or by a program dbx didn't start, dbx refuses rather than
+  send your credentials there: give the tunnel another local port.
 - ClickHouse: `port` is the native port (9000), for `clickhouse-client`; `http_port` (8123, 8443 with
   `?secure=1`, or `?http_port=` in the URL) is the HTTP one, used by `dbx serve` (the panel). A `tunnel` forwards the one you use: HTTP for the panel, native for the client.
 - `stage`: `local`, `dev` and `test` are writable; anything else is read-only unless `readonly = false`.
@@ -82,24 +100,37 @@ Names resolve from this repo first, then included repos, then the global file.
 
 ## Databases running in Docker
 
-Running Postgres and ClickHouse containers show up without configuring anything (any image: a container that exposes
-5432 or sets `PGDATA` is Postgres, one that exposes 8123 is ClickHouse),
-under `docker` in `dbx ls`, the picker and the panel. User, password and database come from the container's environment
-(`POSTGRES_USER`/`POSTGRES_PASSWORD`/`POSTGRES_DB`, `CLICKHOUSE_*`) each time; nothing is written. The address is the
-published port (`localhost:5433`; for ClickHouse 9000's, and 8123's as `http_port`), else the container's IP (Linux only). Containers from this repo's compose file
-(compose's labels put its working directory and compose files inside the repo, worktrees included) come first and
-go by their service name (`dbx run db -- psql`); others by their container name. Save… stores one in this repo,
-its password read by dbx into the keychain. A configured connection with the same name wins, and the container
-goes by its container name. `DBX_DOCKER=0` turns this off.
-`docker` is looked for on the PATH, then where Docker Desktop, Homebrew, OrbStack, Rancher Desktop and Colima install it
-(apps started from the Dock get a minimal PATH); `DBX_DOCKER_BIN` points at another one. When Docker can't be asked,
-`dbx ls` and the panel say why. A container whose port isn't published is listed with a note: it can't be reached
-from the host (except on Linux, through its container IP).
+Running Postgres and ClickHouse containers show up under `docker` in `dbx ls`, the picker and the panel, with
+nothing to configure.
+
+- Any image: a container that exposes 5432 or sets `PGDATA` is Postgres, one that exposes 8123 is ClickHouse.
+- User, password and database come from the container's environment (`POSTGRES_USER`/`POSTGRES_PASSWORD`/`POSTGRES_DB`,
+  `CLICKHOUSE_*`) each time; nothing is written.
+- The address is the published port (`localhost:5433`; for ClickHouse 9000's, and 8123's as `http_port`), else the
+  container's IP (Linux only). A container whose port isn't published is listed with a note.
+- This repo's compose services (worktrees included) come first, by service name (`dbx run db -- psql`); other
+  containers go by their container name, as does one whose name a configured connection already uses.
+- **Save…** in the panel keeps one as a configured connection, its password read by dbx into the keychain.
+- `docker` is looked for on the PATH, then where Docker Desktop, Homebrew, OrbStack, Rancher Desktop and Colima
+  install it (apps started from the Dock get a minimal PATH); `DBX_DOCKER_BIN` points at another one. When Docker
+  can't be asked, `dbx ls` and the panel say why. `DBX_DOCKER=0` turns this off.
 
 ## Storage
 
-`~/.config/dbx/projects/<encoded-repo-path>/dbx.toml`, and `~/.config/dbx/dbx.toml` for global
-connections (override with `$DBX_HOME`). The project is the main checkout of the git repo.
+`~/.config/dbx/projects/<repo>-<hash>/dbx.toml`, and `~/.config/dbx/dbx.toml` for global
+connections (override with `$DBX_HOME`). The project is the main checkout of the git repo, so its worktrees
+share its connections. Files and folders are readable only by you; nothing is written inside the repo.
+
+## Isolation between repos
+
+A repo only sees its own connections, the repos it `include`s, and the global ones, and that holds in the engine too:
+
+- Engine sessions belong to the repo that opened them; another repo's panel can't list, query or close them.
+- Keychain entries are named after their repo (`<repo>#<name>`); a connection that points at another repo's entry
+  is refused, and `dbx cp` copies the secret instead of sharing it.
+- A repo's `.env` references must stay inside it.
+- Editing a connection keeps its saved password only while host, port and user stay the same.
+- Tunnels are never shared between different connections (see `tunnel` above).
 
 ## With agents
 
@@ -129,8 +160,7 @@ idle for 30 minutes. Postgres and ClickHouse.
   use your connections. The token is in `~/.local/state/dbx/serve.json`, readable only by you;
   your own processes can read it, as they can read your connection files.
 - Secrets (`env`, `dotenv`, `cmd`) are read by the engine when a session opens: `{ env = … }` sees
-  the engine's environment (the herdr app's), not the terminal you typed in. A repo's `dotenv` files must be
-  inside it. Editing a connection keeps its saved password only while host, port and user stay the same.
+  the engine's environment (the herdr app's), not the terminal you typed in.
 - Read-only works as in the CLI; writes on prod need the connection's name in `confirm`.
 - ClickHouse goes through its HTTP interface (`http_port`), with a server-side session per panel session
   (`USE` and `SET` last): statements run one request each, in order; cancel is `KILL QUERY`; rows aren't
