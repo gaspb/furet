@@ -52,7 +52,8 @@ fn docker_bin() -> Option<PathBuf> {
     .find(|p| p.is_file())
 }
 
-/// `docker …` with a deadline, so a stuck daemon can't stall the panel.
+/// `docker …` with a deadline, so a stuck daemon can't stall the panel. Output is read while it
+/// runs: `docker inspect` of a few containers is more than a pipe holds, and docker would block.
 fn docker(bin: &Path, args: &[&str]) -> Result<String, String> {
     let mut cmd = Command::new(bin);
     // Credential helpers and contexts (Docker Desktop, OrbStack…) live next to the CLI.
@@ -70,29 +71,46 @@ fn docker(bin: &Path, args: &[&str]) -> Result<String, String> {
         .stderr(Stdio::piped())
         .spawn()
         .map_err(|e| format!("cannot run {}: {e}", bin.display()))?;
+    let drain = |r: Option<Box<dyn std::io::Read + Send>>| {
+        std::thread::spawn(move || {
+            let mut s = String::new();
+            if let Some(mut r) = r {
+                let _ = r.read_to_string(&mut s);
+            }
+            s
+        })
+    };
+    let out = drain(
+        child
+            .stdout
+            .take()
+            .map(|r| Box::new(r) as Box<dyn std::io::Read + Send>),
+    );
+    let err = drain(
+        child
+            .stderr
+            .take()
+            .map(|r| Box::new(r) as Box<dyn std::io::Read + Send>),
+    );
     let start = std::time::Instant::now();
     let status = loop {
         match child.try_wait() {
             Ok(Some(status)) => break status,
             Err(e) => return Err(e.to_string()),
-            Ok(None) if start.elapsed() > Duration::from_secs(3) => {
+            Ok(None) if start.elapsed() > TIMEOUT => {
                 let _ = child.kill();
                 let _ = child.wait();
-                return Err("Docker didn't answer within 3 s".into());
+                return Err(format!(
+                    "Docker didn't answer within {} s",
+                    TIMEOUT.as_secs()
+                ));
             }
             Ok(None) => std::thread::sleep(Duration::from_millis(20)),
         }
     };
-    let read = |r: Option<&mut dyn std::io::Read>| {
-        let mut s = String::new();
-        if let Some(r) = r {
-            let _ = r.read_to_string(&mut s);
-        }
-        s
-    };
-    let out = read(child.stdout.as_mut().map(|r| r as &mut dyn std::io::Read));
+    let out = out.join().unwrap_or_default();
     if !status.success() {
-        let err = read(child.stderr.as_mut().map(|r| r as &mut dyn std::io::Read));
+        let err = err.join().unwrap_or_default();
         let err = err
             .lines()
             .find(|l| !l.trim().is_empty())
@@ -112,6 +130,8 @@ fn docker(bin: &Path, args: &[&str]) -> Result<String, String> {
     }
     Ok(out)
 }
+
+const TIMEOUT: Duration = Duration::from_secs(10);
 
 pub fn enabled() -> bool {
     !matches!(
@@ -452,5 +472,21 @@ mod tests {
         let mut ch = container("acme/analytics:2", &[], json!({}), json!({}));
         ch["Config"]["ExposedPorts"] = json!({ "8123/tcp": {}, "9000/tcp": {} });
         assert_eq!(found(&ch, &[]).unwrap().conn.kind, Some(Kind::Clickhouse));
+    }
+
+    /// `docker inspect` of many containers outgrows a pipe: reading only after exit deadlocked.
+    #[test]
+    fn reads_output_larger_than_a_pipe() {
+        let dir = std::env::temp_dir().join(format!("dbx-fake-docker-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let bin = dir.join("docker");
+        std::fs::write(&bin, "#!/bin/sh\nhead -c 300000 /dev/zero | tr '\\0' x\n").unwrap();
+        std::fs::set_permissions(&bin, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+            .unwrap();
+        let start = std::time::Instant::now();
+        let out = docker(&bin, &["inspect"]).unwrap();
+        assert_eq!(out.len(), 300000);
+        assert!(start.elapsed() < Duration::from_secs(2));
+        let _ = std::fs::remove_dir_all(dir);
     }
 }
