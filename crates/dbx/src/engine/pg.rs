@@ -12,10 +12,10 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio_postgres_rustls::MakeRustlsConnect;
 
-const CELL_MAX: usize = 4000;
-const BUDGET: usize = 6 * 1024 * 1024;
+pub(super) const CELL_MAX: usize = 4000;
+pub(super) const BUDGET: usize = 6 * 1024 * 1024;
 const READONLY_OPTION: &str = "-c default_transaction_read_only=on";
-const WRAP_PREFIX: &str = "select * from (\n";
+pub(super) const WRAP_PREFIX: &str = "select * from (\n";
 
 pub struct Pg {
     client: Client,
@@ -493,7 +493,7 @@ fn collect(messages: Vec<SimpleQueryMessage>, limit: usize) -> Vec<ResultSet> {
     sets
 }
 
-fn truncate(v: &str) -> String {
+pub(super) fn truncate(v: &str) -> String {
     if v.len() <= CELL_MAX {
         return v.to_string();
     }

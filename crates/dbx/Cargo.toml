@@ -20,6 +20,7 @@ rustls = { version = "0.23", default-features = false, features = ["ring", "std"
 serde.workspace = true
 serde_json.workspace = true
 tiny_http = "0.12"
+ureq = { version = "3.5", default-features = false, features = ["rustls"] }
 toml = "1.2"
 toml_edit = "0.25"
 tokio-postgres-rustls = "0.14"

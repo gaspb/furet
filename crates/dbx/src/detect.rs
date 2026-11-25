@@ -271,6 +271,11 @@ fn found(c: &Json, roots: &[&Path]) -> Option<Found> {
         note.push_str(&format!(" · port {inner} not published"));
     }
     let (host, port) = address.unwrap_or_else(|| ("localhost".into(), inner));
+    let http_port = (kind == Kind::Clickhouse)
+        .then(|| self::address(c, 8123))
+        .flatten()
+        .filter(|(h, _)| *h == host)
+        .map(|(_, p)| p);
     Some(Found {
         name,
         here,
@@ -278,6 +283,7 @@ fn found(c: &Json, roots: &[&Path]) -> Option<Found> {
             kind: Some(kind),
             host: Some(Value::Plain(host)),
             port: Some(port),
+            http_port,
             user: Some(Value::Plain(user)),
             password: password.map(Value::Plain),
             database: Some(Value::Plain(database)),
@@ -420,10 +426,8 @@ mod tests {
             compose("meteroid-ent2", "clickhouse", repo),
         );
         ch["Name"] = json!("/meteroid-ent2-clickhouse-1");
-        assert_eq!(
-            found(&ch, &[Path::new(repo)]).unwrap().conn.port,
-            Some(19000)
-        );
+        let f = found(&ch, &[Path::new(repo)]).unwrap();
+        assert_eq!((f.conn.port, f.conn.http_port), (Some(19000), Some(18123)));
         let mut test_pg = container(
             "ghcr.io/meteroid-oss/meteroid-postgres:18.3-standard",
             &[],

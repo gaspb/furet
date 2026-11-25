@@ -220,7 +220,10 @@ pub fn draft_of(scope: &Scope, name: &str) -> Result<Draft> {
     if scope.layer(e).origin == config::Origin::Detected {
         // Saving a container's connection: start from where it is, password included (it goes to
         // the keychain on save, out of the URL).
-        let r = crate::conn::resolve(e, scope.layer(e))?;
+        let mut r = crate::conn::resolve(e, scope.layer(e))?;
+        if r.kind == config::Kind::Clickhouse && r.http_port != 8123 {
+            r.params.push(("http_port".into(), r.http_port.to_string()));
+        }
         return Ok(Draft {
             name: name.into(),
             url: r.url(),

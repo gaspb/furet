@@ -1,15 +1,28 @@
 //! Just enough SQL lexing to split a script into statements and tell a query from the rest.
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Dialect {
+    Postgres,
+    /// Backtick identifiers, and backslash escapes in every quote.
+    Clickhouse,
+}
+
 /// Byte ranges of the statements in `sql`, trimmed, without their `;`. Quotes, comments and
 /// `$tag$` bodies don't split.
 pub fn statements(sql: &str) -> Vec<(usize, usize)> {
+    statements_in(sql, Dialect::Postgres)
+}
+
+pub fn statements_in(sql: &str, dialect: Dialect) -> Vec<(usize, usize)> {
+    let ch = dialect == Dialect::Clickhouse;
     let b = sql.as_bytes();
     let mut out = Vec::new();
     let mut start = 0;
     let mut i = 0;
     while i < b.len() {
         match b[i] {
-            b'\'' | b'"' => i = skip_quoted(b, i),
+            b'\'' | b'"' => i = skip_quoted(b, i, ch),
+            b'`' if ch => i = skip_quoted(b, i, true),
             b'-' if b.get(i + 1) == Some(&b'-') => {
                 i = b[i..]
                     .iter()
@@ -40,10 +53,14 @@ fn push(sql: &str, start: usize, end: usize, out: &mut Vec<(usize, usize)>) {
     out.push((start + lead, end - trail));
 }
 
-fn skip_quoted(b: &[u8], i: usize) -> usize {
+fn skip_quoted(b: &[u8], i: usize, backslash: bool) -> usize {
     let q = b[i];
     let mut j = i + 1;
     while j < b.len() {
+        if backslash && b[j] == b'\\' {
+            j += 2;
+            continue;
+        }
         if b[j] == q {
             if b.get(j + 1) == Some(&q) {
                 j += 2;
@@ -165,8 +182,8 @@ pub fn byte_to_utf16(s: &str, byte: usize) -> usize {
 }
 
 /// The statement holding `cursor` (a byte offset), or the last one before it.
-pub fn at(sql: &str, cursor: usize) -> Option<(usize, usize)> {
-    let all = statements(sql);
+pub fn at(sql: &str, cursor: usize, dialect: Dialect) -> Option<(usize, usize)> {
+    let all = statements_in(sql, dialect);
     all.iter()
         .copied()
         .find(|&(s, e)| cursor >= s && cursor <= e + 1)
@@ -203,6 +220,21 @@ mod tests {
     }
 
     #[test]
+    fn splits_clickhouse_quoting() {
+        let sql = "select `a;b`, 'it\\'s;' from t; select \"x\\\";\" from `t;2`";
+        let ranges = statements_in(sql, Dialect::Clickhouse);
+        let texts: Vec<&str> = ranges.iter().map(|&(s, e)| &sql[s..e]).collect();
+        assert_eq!(
+            texts,
+            vec![
+                "select `a;b`, 'it\\'s;' from t",
+                "select \"x\\\";\" from `t;2`"
+            ]
+        );
+        assert_eq!(statements("select 'a\\'; select 2").len(), 2);
+    }
+
+    #[test]
     fn knows_which_statements_only_read() {
         assert!(pageable("-- hi\nSELECT * FROM users"));
         assert!(pageable("with x as (select 1) select * from x"));
@@ -219,12 +251,24 @@ mod tests {
     #[test]
     fn finds_the_statement_under_the_cursor() {
         let sql = "select 1;\n\nselect 2;\nselect 3";
-        assert_eq!(at(sql, 3).map(|(s, e)| &sql[s..e]), Some("select 1"));
-        assert_eq!(at(sql, 9).map(|(s, e)| &sql[s..e]), Some("select 1"));
-        assert_eq!(at(sql, 10).map(|(s, e)| &sql[s..e]), Some("select 1"));
-        assert_eq!(at(sql, 13).map(|(s, e)| &sql[s..e]), Some("select 2"));
         assert_eq!(
-            at(sql, sql.len()).map(|(s, e)| &sql[s..e]),
+            at(sql, 3, Dialect::Postgres).map(|(s, e)| &sql[s..e]),
+            Some("select 1")
+        );
+        assert_eq!(
+            at(sql, 9, Dialect::Postgres).map(|(s, e)| &sql[s..e]),
+            Some("select 1")
+        );
+        assert_eq!(
+            at(sql, 10, Dialect::Postgres).map(|(s, e)| &sql[s..e]),
+            Some("select 1")
+        );
+        assert_eq!(
+            at(sql, 13, Dialect::Postgres).map(|(s, e)| &sql[s..e]),
+            Some("select 2")
+        );
+        assert_eq!(
+            at(sql, sql.len(), Dialect::Postgres).map(|(s, e)| &sql[s..e]),
             Some("select 3")
         );
     }

@@ -12,6 +12,8 @@ pub struct Resolved {
     pub kind: Kind,
     pub host: String,
     pub port: u16,
+    /// ClickHouse's HTTP port (8123, or 8443 with `secure=1`); 0 for Postgres.
+    pub http_port: u16,
     pub user: Option<String>,
     pub password: Option<String>,
     pub database: Option<String>,
@@ -114,6 +116,7 @@ pub fn resolve(entry: &Entry, layer: &Layer) -> Result<Resolved> {
         kind: Kind::Postgres,
         host: String::new(),
         port: 0,
+        http_port: 0,
         user: None,
         password: None,
         database: None,
@@ -165,6 +168,19 @@ pub fn resolve(entry: &Entry, layer: &Layer) -> Result<Resolved> {
     }
     if r.port == 0 {
         r.port = default_port(kind);
+    }
+    if kind == Kind::Clickhouse {
+        let from_url = r
+            .params
+            .iter()
+            .position(|(k, _)| k == "http_port")
+            .map(|i| r.params.remove(i).1)
+            .and_then(|p| p.parse().ok());
+        let secure = r.param("secure").is_some_and(|v| v == "1" || v == "true");
+        r.http_port = c
+            .http_port
+            .or(from_url)
+            .unwrap_or(if secure { 8443 } else { 8123 });
     }
     Ok(r)
 }
@@ -419,9 +435,24 @@ mod tests {
                               stage = "prod""#,
         );
         let r = resolve(&e, &l).unwrap();
-        assert_eq!(r.port, 9000);
+        assert_eq!((r.port, r.http_port), (9000, 8123));
         assert!(r.client(None).contains(&"--readonly=1".to_string()));
         assert_eq!(r.url(), "clickhouse://default@localhost:9000?readonly=1");
+    }
+
+    #[test]
+    fn clickhouse_http_port_from_the_field_or_the_url() {
+        let (e, l) = entry(r#"url = "clickhouse://default@localhost:19000/db?http_port=18123""#);
+        let r = resolve(&e, &l).unwrap();
+        assert_eq!((r.port, r.http_port), (19000, 18123));
+        assert_eq!(r.url(), "clickhouse://default@localhost:19000/db");
+        let (e, l) = entry(
+            r#"url = "clickhouse://h/db?secure=1&http_port=1"
+               http_port = 9443"#,
+        );
+        assert_eq!(resolve(&e, &l).unwrap().http_port, 9443);
+        let (e, l) = entry(r#"url = "clickhouse://h/db?secure=1""#);
+        assert_eq!(resolve(&e, &l).unwrap().http_port, 8443);
     }
 
     #[test]
