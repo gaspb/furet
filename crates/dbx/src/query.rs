@@ -46,7 +46,12 @@ pub fn saved_sql(cwd: &Path, name: &str) -> Result<String> {
     Ok(history::read_saved(cwd, name)?.sql)
 }
 
-fn request(info: &server::Info, method: &str, path: &str, body: Option<Value>) -> Result<Value> {
+pub fn request(
+    info: &server::Info,
+    method: &str,
+    path: &str,
+    body: Option<Value>,
+) -> Result<Value> {
     let agent = ureq::Agent::config_builder()
         .http_status_as_error(false)
         .build()

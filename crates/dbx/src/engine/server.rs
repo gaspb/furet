@@ -392,6 +392,18 @@ fn respond(engine: &Engine, info: &Info, mut req: Request) -> bool {
                         engine.save(r)
                     }
                 }),
+            (Method::Post, ["drift"]) => parse(&body)
+                .and_then(|v| {
+                    serde_json::from_value::<super::DriftReq>(v)
+                        .map_err(|e| Fail(400, e.to_string()))
+                })
+                .and_then(|d| engine.drift(d)),
+            (Method::Post, ["copy"]) => parse(&body)
+                .and_then(|v| {
+                    serde_json::from_value::<super::CopyReq>(v)
+                        .map_err(|e| Fail(400, e.to_string()))
+                })
+                .and_then(|c| engine.copy(c)),
             (Method::Get, ["history"]) => param("cwd").and_then(|c| {
                 let limit = params
                     .get("limit")

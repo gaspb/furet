@@ -4,6 +4,7 @@ import { div } from "gpui-kit";
 import { v_flex, h_flex } from "gpui-base";
 import { kindOf } from "./grid.js";
 import { go, summarize } from "./nav.js";
+import { openCopy, targets } from "./copy.js";
 
 const COLORS = (t) => ({ number: t.ansi4, time: t.ansi6, json: t.ansi5, uuid: t.muted, text: t.foreground });
 
@@ -54,6 +55,7 @@ export function inspector(view, tab, t, font) {
   return v_flex().id(`dbx-insp-${tab.id}`).size_full().overflow_y_scroll().border_l(1).border_color(t.border).pb(10)
     .child(h_flex().h(30).flex_none().px(12).gap(6).items_center().border_b(1).border_color(t.border)
       .child(div().flex_1().min_w(0).truncate().text_size(12).font_semibold().child(title))
+      .when(targets(view, tab).length > 0 && set.columns.some((c) => c.origin), (e) => e.child(link(`dbx-insp-copy-${tab.id}`, "Copy to…", (cx) => openCopy(view, tab, cx))))
       .child(link(`dbx-insp-json-${tab.id}`, "JSON", (cx) =>
         view.copy(JSON.stringify(Object.fromEntries(set.columns.map((c, i) => [c.name, r[i]])), null, 2), "the row as JSON", cx))))
     .children(fields)

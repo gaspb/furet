@@ -1,6 +1,8 @@
 //! `dbx serve`: a local engine holding database sessions for the herdr panel, over HTTP on 127.0.0.1.
 
 pub mod ch;
+pub mod drift;
+pub mod graph;
 pub mod history;
 pub mod pg;
 pub mod server;
@@ -150,6 +152,38 @@ pub struct QueryReq {
     /// Who ran it, for the history: `panel` unless `dbx query` says `cli` or `agent (…)`.
     #[serde(default)]
     pub by: Option<String>,
+}
+
+#[derive(Deserialize)]
+pub struct DriftReq {
+    pub cwd: PathBuf,
+    pub left: String,
+    pub right: String,
+    #[serde(default)]
+    pub schema: Option<String>,
+}
+
+#[derive(Deserialize)]
+pub struct CopyReq {
+    pub cwd: PathBuf,
+    pub from: String,
+    pub to: String,
+    pub schema: String,
+    pub table: String,
+    pub column: String,
+    pub value: String,
+    /// Also the rows pointing at it (an invoice's lines, a customer's orders).
+    #[serde(default)]
+    pub children: bool,
+    #[serde(default = "yes")]
+    pub mask: bool,
+    /// Only say what would be copied.
+    #[serde(default)]
+    pub dry: bool,
+}
+
+fn yes() -> bool {
+    true
 }
 
 #[derive(Deserialize)]
@@ -650,6 +684,119 @@ impl Engine {
             .referrers(&req.schema, &req.table, &req.row)
             .map_err(|e| Fail(400, format!("{e:#}")))?;
         Ok(json!({ "referrers": out }))
+    }
+
+    /// How two Postgres connections' schemas differ, and the SQL that would align the right one.
+    pub fn drift(&self, req: DriftReq) -> Result<Value, Fail> {
+        let open = |name: &str| {
+            self.open(OpenReq {
+                cwd: req.cwd.clone(),
+                name: name.into(),
+                write: false,
+                confirm: None,
+            })
+            .map(|v| v["id"].as_str().unwrap_or_default().to_string())
+        };
+        let left = open(&req.left)?;
+        let right = match open(&req.right) {
+            Ok(id) => id,
+            Err(e) => {
+                self.sessions.lock().unwrap().remove(&left);
+                return Err(e);
+            }
+        };
+        let get = |id: &str| self.sessions.lock().unwrap().get(id).cloned();
+        let result = (|| {
+            let (Some(a), Some(b)) = (get(&left), get(&right)) else {
+                return fail(500, "sessions went away");
+            };
+            let (Backend::Pg { pg: l, .. }, Backend::Pg { pg: r, .. }) = (&a.backend, &b.backend)
+            else {
+                return fail(400, "comparing schemas works between Postgres connections");
+            };
+            let out = drift::compare(
+                &mut l.lock().unwrap(),
+                &mut r.lock().unwrap(),
+                req.schema.as_deref(),
+            )
+            .map_err(|e| Fail(400, format!("{e:#}")))?;
+            Ok(serde_json::to_value(out)?)
+        })();
+        let mut sessions = self.sessions.lock().unwrap();
+        sessions.remove(&left);
+        sessions.remove(&right);
+        result
+    }
+
+    /// Copies a row and what it needs to a local/dev/test connection (Postgres to Postgres).
+    pub fn copy(&self, req: CopyReq) -> Result<Value, Fail> {
+        let scope = Scope::load_for(&req.cwd, &req.to)?;
+        let target = scope
+            .get(&req.to)
+            .map_err(|e| Fail(404, format!("{e:#}")))?;
+        if target.conn.is_prod() || target.conn.readonly() {
+            return fail(
+                403,
+                format!(
+                    "{} isn't a local, dev or test connection: copies only go there",
+                    req.to
+                ),
+            );
+        }
+        if req.from == req.to {
+            return fail(400, "pick another connection to copy to");
+        }
+        let open = |name: &str, write: bool| {
+            self.open(OpenReq {
+                cwd: req.cwd.clone(),
+                name: name.into(),
+                write,
+                confirm: None,
+            })
+            .map(|v| v["id"].as_str().unwrap_or_default().to_string())
+        };
+        let from = open(&req.from, false)?;
+        let to = match open(&req.to, true) {
+            Ok(id) => id,
+            Err(e) => {
+                self.sessions.lock().unwrap().remove(&from);
+                return Err(e);
+            }
+        };
+        let get = |id: &str| self.sessions.lock().unwrap().get(id).cloned();
+        let result = (|| {
+            let (Some(a), Some(b)) = (get(&from), get(&to)) else {
+                return fail(500, "sessions went away");
+            };
+            let (Backend::Pg { pg: src, .. }, Backend::Pg { pg: dst, .. }) =
+                (&a.backend, &b.backend)
+            else {
+                return fail(400, "copying rows works between Postgres connections");
+            };
+            let rows = graph::collect(
+                &mut src.lock().unwrap(),
+                &req.schema,
+                &req.table,
+                &req.column,
+                &req.value,
+                req.children,
+            )
+            .map_err(|e| Fail(400, format!("{e:#}")))?;
+            let out = if req.dry {
+                graph::Outcome {
+                    plan: graph::plan(&rows),
+                    ..Default::default()
+                }
+            } else {
+                graph::insert(&mut dst.lock().unwrap(), &rows, req.mask)
+                    .map_err(|e| Fail(400, format!("{e:#}")))?
+            };
+            Ok(serde_json::to_value(out)?)
+        })();
+        let mut sessions = self.sessions.lock().unwrap();
+        sessions.remove(&from);
+        sessions.remove(&to);
+        result
     }
 
     pub fn history(&self, cwd: &str, name: Option<&str>, limit: usize) -> Result<Value, Fail> {

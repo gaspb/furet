@@ -22,6 +22,8 @@ pub const PANEL: Mod = Mod {
         "nav.js",
         "finder.js",
         "ask.js",
+        "copy.js",
+        "drift.js",
         "inspector.js",
         "sql.js",
         "database.svg",

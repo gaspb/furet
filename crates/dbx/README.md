@@ -26,6 +26,7 @@ dbx                     pick a connection (type to filter); back to the list whe
 dbx <name> [-w]         open it in its client (psql, clickhouse-client, or yours)
 dbx ls [-a] [--json]    connections visible from here (⇄ = tunnel, green when up)
 dbx query <name> "sql"  run SQL through the engine, print a table (--json, --csv, --saved <q>, - for stdin)
+dbx drift <a> <b>       how two connections' schemas differ, and the SQL to align b (Postgres)
 dbx run <name> -- cmd   run cmd with PG*/CLICKHOUSE_* and DATABASE_URL set, tunnel up
 dbx url <name>          the URL, password included        dbx env <name>   as export lines
 dbx tunnel <name>       keep a tunnel up until Ctrl-C
@@ -143,6 +144,23 @@ in the repo, `.dbx/queries/<name>.sql` (a first line `-- connection: stg` says w
 them through git and agents can run them: `dbx query stg --saved stuck-invoices`. In the panel, Ctrl+R searches both
 and Ctrl/Cmd+S saves the statement under the cursor.
 
+## Copying rows to local
+
+From the panel's row inspector (or a cell's menu), **Copy to…** takes a row and what it needs to a local, dev or test
+connection, to reproduce a bug from stg with real data: the rows its foreign keys point at, all the way up, and with
+*with the rows pointing at it*, its children (an invoice's lines, a customer's orders). A plan shows first (tables and
+row counts). The copy is one transaction, parents first; rows already there stay as they are, generated columns are
+skipped, and sequences move past the copied ids. *Mask personal data* (on by default) replaces emails, phones, people's
+names, addresses and tax ids with stand-ins, the same for the same value. Postgres to Postgres, up to 2000 rows.
+
+## Schema drift
+
+`dbx drift stg prod` (or **Compare schema with…** on a connection in the panel) lists the tables, columns, indexes and
+constraints that are missing or different between two Postgres connections, each with the SQL that would bring the
+second in line with the first: `alter table … add column …`, a full `create table` for a missing table, the index or
+constraint to add or drop. dbx only shows it; drops are commented out. It exits 1 when they differ, so it fits a CI
+check.
+
 ## With agents
 
 `dbx --skill` prints a guide for agents: list connections, look at data with `dbx query` (or run their own tools
@@ -196,6 +214,8 @@ idle for 30 minutes. Postgres and ClickHouse.
 | `GET /sessions/:id/catalog` · `/table?schema=&name=` | schemas, tables and columns; one table's columns, indexes, constraints (ClickHouse: databases; engine, keys, skipping indexes and `create`) |
 | `POST /sessions/:id/apply` `{statements}` | row edits in one transaction (Postgres) |
 | `POST /sessions/:id/lookup` `{schema, table, column, value \| values, limit?}` | the rows where `column = value` (or `in values`), Postgres. Result columns carry `origin` (the table column they copy) and, for a foreign key, `refs` (where it points) |
+| `POST /copy` `{cwd, from, to, schema, table, column, value, children?, mask?, dry?}` | copy a row and what it needs to a local/dev/test connection (`dry`: the plan only) |
+| `POST /drift` `{cwd, left, right, schema?}` | schema differences and the SQL to align `right` |
 | `GET /history?cwd=&name=&limit=` | the statements that ran here (one connection, or all), newest first |
 | `GET /queries?cwd=` · `POST /queries` `{cwd, name, sql, connection?}` · `DELETE /queries?cwd=&name=` | the repo's saved queries |
 | `POST /sessions/:id/referrers` `{schema, table, row}` | the foreign keys pointing at that row, each with how many rows point there (counted up to 1000) |

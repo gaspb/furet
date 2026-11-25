@@ -93,6 +93,16 @@ enum Cmd {
         #[arg(long, default_value_t = 200)]
         limit: usize,
     },
+    /// Compare two connections' schemas (Postgres): what differs, and the SQL to align the second
+    Drift {
+        left: String,
+        right: String,
+        /// Only this schema
+        #[arg(long)]
+        schema: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
     /// Print the connection URL, password included
     Url {
         name: String,
@@ -244,6 +254,54 @@ fn command(cmd: Cmd, cwd: &Path) -> Result<i32> {
                     limit,
                 },
             )
+        }
+        Cmd::Drift {
+            left,
+            right,
+            schema,
+            json,
+        } => {
+            let info = engine::server::ensure()?;
+            let out = query::request(
+                &info,
+                "POST",
+                "/drift",
+                Some(
+                    serde_json::json!({ "cwd": cwd, "left": left, "right": right, "schema": schema }),
+                ),
+            )?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&out)?);
+                return Ok(0);
+            }
+            let diffs = out["differences"].as_array().cloned().unwrap_or_default();
+            for d in &diffs {
+                let mark = match (d["left"].is_null(), d["right"].is_null()) {
+                    (false, true) => format!("only in {left}"),
+                    (true, false) => format!("only in {right}"),
+                    _ => "differs".into(),
+                };
+                println!(
+                    "{:<10} {:<40} {mark}",
+                    d["kind"].as_str().unwrap_or(""),
+                    d["object"].as_str().unwrap_or("")
+                );
+                for side in [("left", &left), ("right", &right)] {
+                    if let Some(v) = d[side.0].as_str() {
+                        println!("    {:<8} {v}", side.1);
+                    }
+                }
+                for line in d["fix"].as_str().unwrap_or("").lines() {
+                    println!("    > {line}");
+                }
+            }
+            println!(
+                "{} difference{}, {} the same",
+                diffs.len(),
+                if diffs.len() == 1 { "" } else { "s" },
+                out["same"]
+            );
+            Ok(if diffs.is_empty() { 0 } else { 1 })
         }
         Cmd::Url { name, write } => {
             let scope = Scope::load_for(cwd, &name)?;
