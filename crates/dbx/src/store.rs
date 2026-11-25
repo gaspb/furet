@@ -439,8 +439,22 @@ pub fn remove(cwd: &Path, name: &str) -> Result<PathBuf> {
     Ok(layer.file.clone())
 }
 
-/// Makes existing connection files private (they were created with default permissions).
+/// Makes existing connection files and their folders private (older versions created them with
+/// default permissions).
 pub fn tighten(file: &Path) {
+    let dirs = [
+        Some(config::home()),
+        Some(config::home().join("projects")),
+        file.parent().map(Path::to_path_buf),
+    ];
+    for dir in dirs.iter().flatten() {
+        if let Ok(m) = fs::metadata(dir)
+            && m.is_dir()
+            && m.permissions().mode() & 0o077 != 0
+        {
+            let _ = fs::set_permissions(dir, fs::Permissions::from_mode(0o700));
+        }
+    }
     if let Ok(m) = fs::metadata(file)
         && m.permissions().mode() & 0o077 != 0
     {

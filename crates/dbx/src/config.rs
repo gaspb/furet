@@ -144,6 +144,9 @@ pub fn ensure_project_dir(root: &Path) -> Result<PathBuf> {
     let file = project_file(root);
     let dir = file.parent().unwrap();
     fs::create_dir_all(dir).with_context(|| format!("cannot create {}", dir.display()))?;
+    for d in [home(), home().join("projects")] {
+        let _ = fs::set_permissions(d, std::os::unix::fs::PermissionsExt::from_mode(0o700));
+    }
     fs::write(dir.join(ROOT_FILE), root.to_string_lossy().as_bytes())?;
     Ok(file)
 }

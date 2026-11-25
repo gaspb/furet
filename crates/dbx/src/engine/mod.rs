@@ -112,6 +112,7 @@ pub struct Engine {
     sessions: Mutex<HashMap<String, Arc<Session>>>,
     /// One slot per connection definition, locked while its tunnel starts.
     tunnels: Mutex<HashMap<String, Arc<Mutex<Weak<Tunnel>>>>>,
+    roots: Mutex<HashMap<String, PathBuf>>,
     pub last_request: Mutex<Option<Instant>>,
 }
 
@@ -366,8 +367,15 @@ impl Engine {
         }
     }
 
-    pub fn session(&self, id: &str) -> Result<Arc<Session>, Fail> {
-        let s = self.sessions.lock().unwrap().get(id).cloned();
+    /// A session of the repo at `root`: another repo's session doesn't exist from here.
+    pub fn session(&self, root: &std::path::Path, id: &str) -> Result<Arc<Session>, Fail> {
+        let s = self
+            .sessions
+            .lock()
+            .unwrap()
+            .get(id)
+            .cloned()
+            .filter(|s| s.root == root);
         let Some(s) = s else {
             return fail(
                 404,
@@ -378,26 +386,44 @@ impl Engine {
         Ok(s)
     }
 
-    pub fn list(&self) -> Value {
+    /// The repo a client folder belongs to (cached: resolving runs git).
+    pub fn root_of(&self, cwd: &str) -> Result<PathBuf, Fail> {
+        if let Some(r) = self.roots.lock().unwrap().get(cwd) {
+            return Ok(r.clone());
+        }
+        let root = Scope::load(std::path::Path::new(cwd))?.root;
+        self.roots
+            .lock()
+            .unwrap()
+            .insert(cwd.to_string(), root.clone());
+        Ok(root)
+    }
+
+    pub fn list(&self, root: &std::path::Path) -> Value {
         Value::Array(
             self.sessions
                 .lock()
                 .unwrap()
                 .values()
+                .filter(|s| s.root == root)
                 .map(|s| s.describe())
                 .collect(),
         )
     }
 
-    pub fn close(&self, id: &str) -> Result<Value, Fail> {
-        match self.sessions.lock().unwrap().remove(id) {
-            Some(_) => Ok(json!({ "closed": id })),
-            None => fail(404, "no such session"),
+    pub fn close(&self, root: &std::path::Path, id: &str) -> Result<Value, Fail> {
+        let mut sessions = self.sessions.lock().unwrap();
+        match sessions.get(id) {
+            Some(s) if s.root == root => {
+                sessions.remove(id);
+                Ok(json!({ "closed": id }))
+            }
+            _ => fail(404, "no such session"),
         }
     }
 
-    pub fn query(&self, id: &str, req: QueryReq) -> Result<Value, Fail> {
-        let s = self.session(id)?;
+    pub fn query(&self, root: &std::path::Path, id: &str, req: QueryReq) -> Result<Value, Fail> {
+        let s = self.session(root, id)?;
         let sql = &req.sql;
         let clamp = |o: usize| sql::utf16_to_byte(sql, o);
         let range = if req.all {
@@ -424,8 +450,8 @@ impl Engine {
         Ok(serde_json::to_value(out)?)
     }
 
-    pub fn cancel(&self, id: &str) -> Result<Value, Fail> {
-        let s = self.session(id)?;
+    pub fn cancel(&self, root: &std::path::Path, id: &str) -> Result<Value, Fail> {
+        let s = self.session(root, id)?;
         match &s.backend {
             Backend::Pg { cancel, .. } => {
                 let (token, tls) = cancel.clone();
@@ -436,8 +462,8 @@ impl Engine {
         Ok(json!({ "cancelled": id }))
     }
 
-    pub fn mode(&self, id: &str, req: ModeReq) -> Result<Value, Fail> {
-        let s = self.session(id)?;
+    pub fn mode(&self, root: &std::path::Path, id: &str, req: ModeReq) -> Result<Value, Fail> {
+        let s = self.session(root, id)?;
         check_write(&s.name, s.prod, req.write, req.confirm.as_deref())?;
         match &s.backend {
             Backend::Pg { pg, .. } => pg.lock().unwrap().set_readonly(!req.write)?,
@@ -449,16 +475,16 @@ impl Engine {
         Ok(s.describe())
     }
 
-    pub fn catalog(&self, id: &str) -> Result<Value, Fail> {
-        let s = self.session(id)?;
+    pub fn catalog(&self, root: &std::path::Path, id: &str) -> Result<Value, Fail> {
+        let s = self.session(root, id)?;
         Ok(match &s.backend {
             Backend::Pg { pg, .. } => pg.lock().unwrap().catalog()?,
             Backend::Ch(ch) => ch.catalog()?,
         })
     }
 
-    pub fn apply(&self, id: &str, req: ApplyReq) -> Result<Value, Fail> {
-        let s = self.session(id)?;
+    pub fn apply(&self, root: &std::path::Path, id: &str, req: ApplyReq) -> Result<Value, Fail> {
+        let s = self.session(root, id)?;
         if req.statements.is_empty() {
             return fail(400, "nothing to apply");
         }
@@ -476,8 +502,14 @@ impl Engine {
         })
     }
 
-    pub fn table(&self, id: &str, schema: &str, name: &str) -> Result<Value, Fail> {
-        let s = self.session(id)?;
+    pub fn table(
+        &self,
+        root: &std::path::Path,
+        id: &str,
+        schema: &str,
+        name: &str,
+    ) -> Result<Value, Fail> {
+        let s = self.session(root, id)?;
         Ok(match &s.backend {
             Backend::Pg { pg, .. } => pg.lock().unwrap().table(schema, name)?,
             Backend::Ch(ch) => ch.table(schema, name)?,

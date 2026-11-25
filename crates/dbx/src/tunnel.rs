@@ -163,7 +163,7 @@ impl Tunnel {
                     );
                 }
                 if crate::store::write_private(&path, &serde_json::to_string(&record)?).is_ok() {
-                    remember_record(&path);
+                    remove_on_signal(&path);
                     t.record = Some(path);
                 }
                 return Ok(Some(t));
@@ -265,11 +265,12 @@ fn unregister(pgid: i32) {
     }
 }
 
-/// Record files of running tunnels, as C strings, for the signal handler to remove.
+/// Files to remove if a signal ends dbx, as C strings the handler can use.
 static RECORDS: [std::sync::atomic::AtomicPtr<libc::c_char>; 16] =
     [const { std::sync::atomic::AtomicPtr::new(std::ptr::null_mut()) }; 16];
 
-fn remember_record(path: &Path) {
+/// A file the signal handler removes on the way out (tunnel records, the engine's serve.json).
+pub fn remove_on_signal(path: &Path) {
     let Ok(c) = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()) else {
         return;
     };
