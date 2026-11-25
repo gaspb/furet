@@ -306,6 +306,12 @@ fn respond(engine: &Engine, info: &Info, mut req: Request) -> bool {
             (Method::Get, ["connections", "draft"]) => {
                 param("cwd").and_then(|c| param("name").and_then(|n| engine.draft(&c, &n)))
             }
+            (Method::Post, ["connections", "disconnect"]) => parse(&body)
+                .and_then(|v| {
+                    serde_json::from_value::<super::NameReq>(v)
+                        .map_err(|e| Fail(400, e.to_string()))
+                })
+                .and_then(|r| engine.disconnect(r)),
             (Method::Post, ["connections", what @ ("test" | "save")]) => parse(&body)
                 .and_then(|v| {
                     serde_json::from_value::<super::DraftReq>(v)

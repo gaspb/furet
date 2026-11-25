@@ -35,6 +35,8 @@ pub fn fail<T>(status: u16, msg: impl Into<String>) -> Result<T, Fail> {
 pub struct Session {
     pub id: String,
     pub name: String,
+    /// The repo it was opened for: a name means different things in different repos.
+    pub root: PathBuf,
     pub prod: bool,
     pub info: Value,
     pg: Mutex<pg::Pg>,
@@ -101,6 +103,12 @@ pub struct QueryReq {
 }
 
 #[derive(Deserialize)]
+pub struct NameReq {
+    pub cwd: PathBuf,
+    pub name: String,
+}
+
+#[derive(Deserialize)]
 pub struct ApplyReq {
     pub statements: Vec<String>,
 }
@@ -128,11 +136,30 @@ fn check_write(name: &str, prod: bool, write: bool, confirm: Option<&str>) -> Re
 impl Engine {
     pub fn connections(&self, cwd: &str) -> Result<Value, Fail> {
         let scope = Scope::load(std::path::Path::new(cwd))?;
+        let sessions = self.sessions.lock().unwrap();
+        let mut rows = serde_json::to_value(crate::rows(&scope))?;
+        for row in rows.as_array_mut().into_iter().flatten() {
+            let name = row["name"].as_str().unwrap_or_default();
+            let open = sessions
+                .values()
+                .filter(|s| s.root == scope.root && s.name == name)
+                .count();
+            row["sessions"] = json!(open);
+        }
         Ok(json!({
             "root": scope.root,
             "file": crate::config::project_file(&scope.root),
-            "connections": crate::rows(&scope),
+            "connections": rows,
         }))
+    }
+
+    /// Closes every session on a connection of this repo; its tunnel stops with the last one.
+    pub fn disconnect(&self, req: NameReq) -> Result<Value, Fail> {
+        let root = Scope::load(&req.cwd)?.root;
+        let mut sessions = self.sessions.lock().unwrap();
+        let before = sessions.len();
+        sessions.retain(|_, s| !(s.root == root && s.name == req.name));
+        Ok(json!({ "closed": before - sessions.len() }))
     }
 
     pub fn draft(&self, cwd: &str, name: &str) -> Result<Value, Fail> {
@@ -247,6 +274,7 @@ impl Engine {
         let s = Arc::new(Session {
             id: random_id(),
             name: req.name,
+            root: scope.root.clone(),
             prod: prod && readonly_default,
             info,
             cancel: pg.cancel_token(),
@@ -286,7 +314,7 @@ impl Engine {
     pub fn session(&self, id: &str) -> Result<Arc<Session>, Fail> {
         let s = self.sessions.lock().unwrap().get(id).cloned();
         let Some(s) = s else {
-            return fail(404, "no such session (closed after 30 minutes idle?)");
+            return fail(404, "no such session (disconnected, or idle for 30 minutes)");
         };
         s.touch();
         Ok(s)
