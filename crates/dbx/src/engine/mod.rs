@@ -1,6 +1,7 @@
 //! `dbx serve`: a local engine holding database sessions for the herdr panel, over HTTP on 127.0.0.1.
 
 pub mod ch;
+pub mod history;
 pub mod pg;
 pub mod server;
 pub mod sql;
@@ -146,6 +147,18 @@ pub struct QueryReq {
     pub limit: Option<usize>,
     #[serde(default)]
     pub offset: usize,
+    /// Who ran it, for the history: `panel` unless `dbx query` says `cli` or `agent (…)`.
+    #[serde(default)]
+    pub by: Option<String>,
+}
+
+#[derive(Deserialize)]
+pub struct SaveQueryReq {
+    pub cwd: PathBuf,
+    pub name: String,
+    pub sql: String,
+    #[serde(default)]
+    pub connection: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -460,7 +473,11 @@ impl Engine {
         let range = if req.all {
             (0, sql.len())
         } else if let Some((a, b)) = req.selection.filter(|(a, b)| a != b) {
-            (clamp(a.min(b)), clamp(a.max(b)))
+            let (a, b) = (clamp(a.min(b)), clamp(a.max(b)));
+            let picked = &sql[a..b];
+            let start = a + (picked.len() - picked.trim_start().len());
+            let end = a + picked.trim_end().trim_end_matches(';').trim_end().len();
+            (start, end.max(start))
         } else {
             match sql::at(sql, clamp(req.cursor.unwrap_or(0)), s.dialect()) {
                 Some(r) => r,
@@ -487,6 +504,22 @@ impl Engine {
         };
         if out.error.as_ref().is_some_and(|e| e.closed) {
             self.sessions.lock().unwrap().remove(id);
+        }
+        let ran = sql[range.0..range.1].trim();
+        if !ran.is_empty() {
+            let last = out.results.last();
+            history::record(
+                &s.root,
+                &history::Entry {
+                    at: history::now(),
+                    sql: ran.to_string(),
+                    ms: out.elapsed_ms,
+                    rows: last.map(|r| r.affected.unwrap_or(r.rows.len() as u64)),
+                    error: out.error.as_ref().map(|e| e.message.clone()),
+                    by: req.by.clone().unwrap_or_else(|| "panel".into()),
+                    conn: s.name.clone(),
+                },
+            );
         }
         let mut v = serde_json::to_value(out)?;
         if let Backend::Pg { pg, .. } = &s.backend {
@@ -617,6 +650,27 @@ impl Engine {
             .referrers(&req.schema, &req.table, &req.row)
             .map_err(|e| Fail(400, format!("{e:#}")))?;
         Ok(json!({ "referrers": out }))
+    }
+
+    pub fn history(&self, cwd: &str, name: Option<&str>, limit: usize) -> Result<Value, Fail> {
+        let root = self.root_of(cwd)?;
+        Ok(json!({ "history": history::recent(&root, name, limit.clamp(1, 2000)) }))
+    }
+
+    pub fn queries(&self, cwd: &str) -> Result<Value, Fail> {
+        Ok(json!({ "queries": history::saved(std::path::Path::new(cwd)) }))
+    }
+
+    pub fn save_query(&self, req: SaveQueryReq) -> Result<Value, Fail> {
+        let file = history::save(&req.cwd, &req.name, &req.sql, req.connection.as_deref())
+            .map_err(|e| Fail(400, format!("{e:#}")))?;
+        Ok(json!({ "saved": req.name, "file": file }))
+    }
+
+    pub fn remove_query(&self, cwd: &str, name: &str) -> Result<Value, Fail> {
+        history::remove(std::path::Path::new(cwd), name)
+            .map_err(|e| Fail(400, format!("{e:#}")))?;
+        Ok(json!({ "removed": name }))
     }
 
     /// Closes sessions idle for longer than `SESSION_IDLE` or whose connection dropped.

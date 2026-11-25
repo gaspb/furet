@@ -20,6 +20,8 @@ pub const PANEL: Mod = Mod {
         "lines.js",
         "menu.js",
         "nav.js",
+        "finder.js",
+        "ask.js",
         "inspector.js",
         "sql.js",
         "database.svg",
