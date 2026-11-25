@@ -8,6 +8,8 @@ outside the repo, and has `--json` output for the panels in [herdr-mods](https:/
 | --- | --- |
 | [dbx](crates/dbx) | Postgres and ClickHouse connections per repo: secrets by reference, kubectl tunnels, read-only remotes |
 
+| [dbx-app](crates/dbx-app) | dbx's database explorer as a native window (GPUI), on the same engine |
+
 Related: [sidenote](https://github.com/gaspb/sidenote), per-repo scratch notes.
 
 ## Install

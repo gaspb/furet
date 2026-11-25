@@ -1,6 +1,8 @@
 [workspace]
 resolver = "3"
 members = ["crates/*"]
+# The native app pulls in GPUI: build it on purpose (cargo build -p dbx-app).
+default-members = ["crates/common", "crates/dbx"]
 
 [workspace.package]
 edition = "2024"
