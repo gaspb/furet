@@ -1,0 +1,17 @@
+[package]
+name = "dbx-app"
+version = "0.1.0"
+description = "dbx's database explorer as a native window (GPUI), on the same engine as the CLI and the herdr panel"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+gpui-kit = { version = "0.11", features = ["tree-sitter-sql"] }
+serde.workspace = true
+serde_json = { workspace = true, features = ["preserve_order"] }
+ureq = { version = "3.5", default-features = false }
+
+[package.metadata.dist]
+dist = false
