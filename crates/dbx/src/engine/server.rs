@@ -46,7 +46,7 @@ fn build_id() -> String {
         .unwrap_or_default()
 }
 
-fn dir() -> PathBuf {
+pub(crate) fn dir() -> PathBuf {
     std::env::var_os("DBX_STATE")
         .map(PathBuf::from)
         .unwrap_or_else(|| common::scope::state_home().join("dbx"))

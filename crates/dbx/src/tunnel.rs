@@ -27,6 +27,59 @@ type Log = Arc<Mutex<VecDeque<String>>>;
 pub struct Tunnel {
     child: Child,
     log: Log,
+    record: Option<std::path::PathBuf>,
+}
+
+/// What dbx records about a tunnel it started, in its private state folder, so another dbx process
+/// (the engine, a `dbx tunnel` in a terminal) can tell its own tunnels from anything else on a port.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct Record {
+    /// The connection definition it was started for: `<connections file>#<name>`.
+    owner: String,
+    pgid: i32,
+}
+
+fn record_path(host: &str, port: u16) -> std::path::PathBuf {
+    let host: String = host
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '.' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    crate::engine::server::dir()
+        .join("tunnels")
+        .join(format!("{host}-{port}.json"))
+}
+
+fn alive(pgid: i32) -> bool {
+    pgid > 0 && unsafe { libc::kill(pgid, 0) } == 0
+}
+
+/// Who holds `port`, when `lsof` can tell.
+fn listener(port: u16) -> Option<String> {
+    let out = Command::new("lsof")
+        .args(["-nP", &format!("-iTCP:{port}"), "-sTCP:LISTEN", "-Fpc"])
+        .output()
+        .ok()?;
+    let text = String::from_utf8_lossy(&out.stdout);
+    let pid = text.lines().find_map(|l| l.strip_prefix('p'))?;
+    let cmd = text
+        .lines()
+        .find_map(|l| l.strip_prefix('c'))
+        .unwrap_or("?");
+    Some(format!("pid {pid} ({cmd})"))
+}
+
+/// A connection definition as people read it: `stg in ~/src/api`.
+fn label(owner: &str) -> String {
+    match owner.rsplit_once('#') {
+        Some((file, name)) => format!("{name} ({file})"),
+        None => owner.to_string(),
+    }
 }
 
 fn drain(from: impl Read + Send + 'static, log: Log) {
@@ -42,10 +95,36 @@ fn drain(from: impl Read + Send + 'static, log: Log) {
 }
 
 impl Tunnel {
-    /// Starts `cmd` unless `host:port` already answers (another pane's tunnel, say), then waits for it.
-    pub fn ensure(cmd: &str, host: &str, port: u16, base: &Path) -> Result<Option<Tunnel>> {
+    /// Starts `cmd` for the connection `owner` (`<file>#<name>`) and waits for `host:port`.
+    /// A port that already answers is used only when it's this connection's tunnel started by
+    /// another dbx process (Ok(None)); anything else on it is refused, so credentials only ever go
+    /// through a tunnel started for them.
+    pub fn ensure(
+        cmd: &str,
+        host: &str,
+        port: u16,
+        base: &Path,
+        owner: &str,
+    ) -> Result<Option<Tunnel>> {
+        let path = record_path(host, port);
         if is_up(host, port) {
-            return Ok(None);
+            let record: Option<Record> = std::fs::read_to_string(&path)
+                .ok()
+                .and_then(|t| serde_json::from_str(&t).ok());
+            match record {
+                Some(r) if alive(r.pgid) && r.owner == owner => return Ok(None),
+                Some(r) if alive(r.pgid) => bail!(
+                    "{host}:{port} is already forwarded for {}: give this connection's tunnel another local port",
+                    label(&r.owner)
+                ),
+                _ => bail!(
+                    "{host}:{port} is already in use by another program{}; dbx only connects through a tunnel it \
+                     started for this connection: stop it, or use another local port in the tunnel and the url",
+                    listener(port)
+                        .map(|l| format!(" ({l})"))
+                        .unwrap_or_default()
+                ),
+            }
         }
         eprintln!(
             "{}",
@@ -64,10 +143,29 @@ impl Tunnel {
         drain(child.stdout.take().unwrap(), log.clone());
         drain(child.stderr.take().unwrap(), log.clone());
         register(child.id() as i32);
-        let mut t = Tunnel { child, log };
+        let mut t = Tunnel {
+            child,
+            log,
+            record: None,
+        };
         let start = Instant::now();
         loop {
             if is_up(host, port) {
+                let record = Record {
+                    owner: owner.to_string(),
+                    pgid: t.child.id() as i32,
+                };
+                if let Some(dir) = path.parent() {
+                    let _ = std::fs::create_dir_all(dir);
+                    let _ = std::fs::set_permissions(
+                        dir,
+                        std::os::unix::fs::PermissionsExt::from_mode(0o700),
+                    );
+                }
+                if crate::store::write_private(&path, &serde_json::to_string(&record)?).is_ok() {
+                    remember_record(&path);
+                    t.record = Some(path);
+                }
                 return Ok(Some(t));
             }
             if let Some(status) = t.child.try_wait()? {
@@ -109,6 +207,15 @@ impl Drop for Tunnel {
     fn drop(&mut self) {
         let pgid = self.child.id() as i32;
         unregister(pgid);
+        if let Some(path) = &self.record {
+            let ours = std::fs::read_to_string(path)
+                .ok()
+                .and_then(|t| serde_json::from_str::<Record>(&t).ok())
+                .is_some_and(|r| r.pgid == pgid);
+            if ours {
+                let _ = std::fs::remove_file(path);
+            }
+        }
         unsafe { libc::kill(-pgid, libc::SIGTERM) };
         for _ in 0..20 {
             if matches!(self.child.try_wait(), Ok(Some(_))) {
@@ -158,7 +265,38 @@ fn unregister(pgid: i32) {
     }
 }
 
+/// Record files of running tunnels, as C strings, for the signal handler to remove.
+static RECORDS: [std::sync::atomic::AtomicPtr<libc::c_char>; 16] =
+    [const { std::sync::atomic::AtomicPtr::new(std::ptr::null_mut()) }; 16];
+
+fn remember_record(path: &Path) {
+    let Ok(c) = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()) else {
+        return;
+    };
+    let raw = c.into_raw();
+    for slot in &RECORDS {
+        if slot
+            .compare_exchange(
+                std::ptr::null_mut(),
+                raw,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            )
+            .is_ok()
+        {
+            return;
+        }
+    }
+    drop(unsafe { std::ffi::CString::from_raw(raw) });
+}
+
 extern "C" fn stop_tunnels_and_die(sig: libc::c_int) {
+    for slot in &RECORDS {
+        let p = slot.load(Ordering::SeqCst);
+        if !p.is_null() {
+            unsafe { libc::unlink(p) };
+        }
+    }
     for slot in &GROUPS {
         let pgid = slot.load(Ordering::SeqCst);
         if pgid > 0 {

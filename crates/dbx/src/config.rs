@@ -342,6 +342,18 @@ impl Scope {
         anyhow::bail!("no connection named {name:?} (have: {})", names.join(", "))
     }
 
+    /// The definition a connection comes from, `<file>#<name>`: what a tunnel belongs to, so the
+    /// same global or included connection shares one, and different ones never do.
+    pub fn owner(&self, e: &Entry) -> String {
+        let l = self.layer(e);
+        let file = if l.origin == Origin::Detected {
+            "docker".to_string()
+        } else {
+            tilde(&l.file)
+        };
+        format!("{file}#{}", e.name)
+    }
+
     pub fn layer(&self, e: &Entry) -> &Layer {
         &self.layers[e.layer]
     }

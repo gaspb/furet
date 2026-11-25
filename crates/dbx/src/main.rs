@@ -280,7 +280,7 @@ fn prepare(scope: &Scope, name: &str, write: bool) -> Result<(Resolved, Option<T
     let r = resolve(scope, name, write)?;
     let e = scope.get(name)?;
     let tunnel = match &e.conn.tunnel {
-        Some(cmd) => Tunnel::ensure(cmd, &r.host, r.port, &scope.layer(e).base)?,
+        Some(cmd) => Tunnel::ensure(cmd, &r.host, r.port, &scope.layer(e).base, &scope.owner(e))?,
         None => None,
     };
     Ok((r, tunnel))
@@ -382,7 +382,8 @@ fn keep_tunnel(scope: &Scope, name: &str) -> Result<i32> {
         bail!("{name} has no tunnel")
     };
     let r = conn::resolve(e, scope.layer(e))?;
-    let Some(mut t) = Tunnel::ensure(cmd, &r.host, r.port, &scope.layer(e).base)? else {
+    let Some(mut t) = Tunnel::ensure(cmd, &r.host, r.port, &scope.layer(e).base, &scope.owner(e))?
+    else {
         eprintln!(
             "{}:{} is already reachable (another tunnel?)",
             r.host, r.port

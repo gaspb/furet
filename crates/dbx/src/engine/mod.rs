@@ -110,7 +110,8 @@ impl Session {
 #[derive(Default)]
 pub struct Engine {
     sessions: Mutex<HashMap<String, Arc<Session>>>,
-    tunnels: Mutex<HashMap<(String, u16), Weak<Tunnel>>>,
+    /// One slot per connection definition, locked while its tunnel starts.
+    tunnels: Mutex<HashMap<String, Arc<Mutex<Weak<Tunnel>>>>>,
     pub last_request: Mutex<Option<Instant>>,
 }
 
@@ -238,8 +239,18 @@ impl Engine {
         };
         let layer = &scope.layers[0];
         let r = conn::resolve(&entry, layer).map_err(|e| Fail(400, format!("{e:#}")))?;
+        let file = if req.draft.global {
+            crate::config::global_file()
+        } else {
+            layer.file.clone()
+        };
+        let owner = format!(
+            "{}#{}",
+            crate::config::tilde(&file),
+            req.previous.as_deref().unwrap_or(&req.draft.name)
+        );
         let _tunnel = match &entry.conn.tunnel {
-            Some(cmd) => self.tunnel(cmd, &r.host, engine_port(&r), &layer.base)?,
+            Some(cmd) => self.tunnel(cmd, &r.host, engine_port(&r), &layer.base, &owner)?,
             None => None,
         };
         match Backend::connect(&r) {
@@ -279,7 +290,13 @@ impl Engine {
             r.readonly = false;
         }
         let tunnel = match &entry.conn.tunnel {
-            Some(cmd) => self.tunnel(cmd, &r.host, engine_port(&r), &layer.base)?,
+            Some(cmd) => self.tunnel(
+                cmd,
+                &r.host,
+                engine_port(&r),
+                &layer.base,
+                &scope.owner(entry),
+            )?,
             None => None,
         };
         let backend = Backend::connect(&r).map_err(|e| Fail(502, format!("{e:#}")))?;
@@ -316,23 +333,33 @@ impl Engine {
         Ok(v)
     }
 
-    /// Sessions on the same tunnelled port share one tunnel; it stops with the last of them.
+    /// Sessions on the same connection definition share its tunnel; it stops with the last of them.
+    /// Starting one only blocks other opens of that same definition.
     fn tunnel(
         &self,
         cmd: &str,
         host: &str,
         port: u16,
         base: &std::path::Path,
+        owner: &str,
     ) -> Result<Option<Arc<Tunnel>>, Fail> {
-        let key = (host.to_string(), port);
-        let mut tunnels = self.tunnels.lock().unwrap();
-        if let Some(t) = tunnels.get(&key).and_then(Weak::upgrade) {
+        let slot = self
+            .tunnels
+            .lock()
+            .unwrap()
+            .entry(owner.to_string())
+            .or_default()
+            .clone();
+        let mut held = slot.lock().unwrap();
+        if let Some(t) = held.upgrade() {
             return Ok(Some(t));
         }
-        match Tunnel::ensure(cmd, host, port, base).map_err(|e| Fail(502, format!("{e:#}")))? {
+        match Tunnel::ensure(cmd, host, port, base, owner)
+            .map_err(|e| Fail(502, format!("{e:#}")))?
+        {
             Some(t) => {
                 let t = Arc::new(t);
-                tunnels.insert(key, Arc::downgrade(&t));
+                *held = Arc::downgrade(&t);
                 Ok(Some(t))
             }
             None => Ok(None),
