@@ -42,6 +42,9 @@ pub struct Column {
     pub origin: Option<Ref>,
 }
 
+/// A row as text, as Postgres sends it (null as None).
+pub type TextRow = Vec<Option<String>>;
+
 /// A referenced column: `select * from schema.table where column = <value>` finds the row.
 #[derive(Serialize, Debug, Clone)]
 pub struct Ref {
@@ -344,6 +347,35 @@ impl Pg {
             set.columns = columns;
             set
         }))
+    }
+
+    /// Rows as text, whole, with their column names (for copying between databases).
+    pub fn text_rows(&mut self, sql: &str) -> Result<(Vec<String>, Vec<TextRow>)> {
+        let mut columns = Vec::new();
+        let mut rows = Vec::new();
+        for m in self.client.simple_query(sql)? {
+            match m {
+                SimpleQueryMessage::RowDescription(c) => {
+                    columns = c.iter().map(|x| x.name().to_string()).collect()
+                }
+                SimpleQueryMessage::Row(r) => {
+                    rows.push((0..r.len()).map(|i| r.get(i).map(String::from)).collect())
+                }
+                _ => {}
+            }
+        }
+        Ok((columns, rows))
+    }
+
+    /// Runs one statement; how many rows it changed.
+    pub fn execute(&mut self, sql: &str) -> Result<u64> {
+        let mut n = 0;
+        for m in self.client.simple_query(sql)? {
+            if let SimpleQueryMessage::CommandComplete(c) = m {
+                n = c;
+            }
+        }
+        Ok(n)
     }
 
     /// Names the table columns results come from (once per column per session).

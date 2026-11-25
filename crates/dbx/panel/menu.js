@@ -12,6 +12,7 @@ export function openMenu(view, e, items, cx) {
   const list = items.filter(Boolean);
   if (!list.length) return;
   view.ctx = { x: e.position.x, y: e.position.y, items: list, at: list.findIndex(usable) };
+  view.menuAt = e.position;
   // The menu isn't drawn yet: it takes the keyboard on the next frame.
   cx.timer.after(16, (cx) => { if (view.ctx) { view.menuHandle.focus(); cx.notify(); } });
   cx.notify();

@@ -15,6 +15,8 @@ import { go, back, resetTrail, cellTarget, selected, prefetch, cellSummary, trai
 import { inspector } from "./inspector.js";
 import { openFinder, closeFinder, finderKey, finderPanel, openSave, submitSave, saveBar } from "./finder.js";
 import { openAsk, closeAsk, sendAsk, askBar } from "./ask.js";
+import { openCopy, copyBar, targets } from "./copy.js";
+import { openDrift, comparable, driftBody } from "./drift.js";
 import * as lineOps from "./lines.js";
 
 const LIMITS = [100, 500, 2000];
@@ -783,6 +785,8 @@ export default class Dbx extends View {
         this.source(name).open && { label: "Refresh", run: (cx) => this.refreshCatalog(name, cx) },
         "-",
         { label: "Copy name", run: (cx) => this.copy(name, "the name", cx) },
+        (c?.kind ?? "postgres") === "postgres" && comparable(this, name).length > 0 && { label: "Compare schema with…", run: (cx) =>
+          openMenu(this, { position: this.menuAt }, comparable(this, name).map((o) => ({ label: o.name, hint: o.stage, run: (cx) => openDrift(this, name, o.name, cx) })), cx) },
         c?.detected && { label: "Save…", run: (cx) => openForm(this, name, cx, { fromDetected: true }) },
         own && { label: "Edit…", run: (cx) => openForm(this, name, cx) },
         !c?.detected && { label: "Open the file", run: () => editFile(this, c?.source === "global") },
@@ -868,6 +872,8 @@ export default class Dbx extends View {
       tab.kind === "table" && "-",
       tab.kind === "table" && { label: v === null ? "Only rows where it's null" : "Only rows with this value", run: () => filter(false) },
       tab.kind === "table" && { label: v === null ? "Only rows where it isn't null" : "Rows without this value", run: () => filter(true) },
+      targets(this, tab).length > 0 && set.columns.some((c) => c.origin) && "-",
+      targets(this, tab).length > 0 && set.columns.some((c) => c.origin) && { label: "Copy the row to a local database…", run: (cx) => openCopy(this, tab, cx) },
       editable && "-",
       editable && { label: "Edit", hint: "↵", run: (cx) => startEdit(this, tab, cx) },
       editable && { label: "Set NULL", run: (cx) => { tab.editing = { row, col }; commitEdit(tab, null, cx); } },
@@ -1001,8 +1007,8 @@ export default class Dbx extends View {
           .bg(on ? t.selected : t.background).hover((s) => s.bg(on ? t.selected : t.hover))
           .on_click((_e, cx) => { this.active = tab.id; this.current = tab.conn ?? this.current; cx.notify(); })
           .on_mouse_down("right", (e, cx) => this.tabMenu(tab, e, cx))
-          .child(div().w(6).h(6).rounded(3).bg(tab.kind === "form" || tab.kind === "help" ? t.dim : stageColor(t, c?.stage)))
-          .child(div().text_size(12).text_color(on ? t.foreground : t.muted).child(tab.kind === "console" ? `${tab.conn} ›_` : tab.kind === "form" || tab.kind === "help" ? tab.title : `${tab.conn}.${tab.title}`))
+          .child(div().w(6).h(6).rounded(3).bg(["form", "help", "drift"].includes(tab.kind) ? t.dim : stageColor(t, c?.stage)))
+          .child(div().text_size(12).text_color(on ? t.foreground : t.muted).child(tab.kind === "console" ? `${tab.conn} ›_` : ["form", "help", "drift"].includes(tab.kind) ? tab.title : `${tab.conn}.${tab.title}`))
           .child(div().id(`dbx-close-${tab.id}`).px(3).rounded(3).text_size(11).text_color(t.dim).hover((s) => s.bg(t.hover).text_color(t.foreground))
             .on_click((_e, cx) => { cx.stop_propagation(); this.closeTab(tab.id, cx); }).child("✕"));
       }))
@@ -1058,6 +1064,7 @@ export default class Dbx extends View {
       });
     const showing = tab.inspector !== false && Boolean(set.rows[tab.sel?.row]);
     const area = div().flex_1().min_h(0).flex().flex_col()
+      .when(Boolean(tab.copy), (e) => e.child(copyBar(this, tab, t)))
       .when(Boolean(tab.trail?.length), (e) => e.child(trailBar(this, tab, t)))
       .when(Boolean(tab.navigating), (e) => e.child(div().px(12).py(2).text_size(11).text_color(t.dim).child("Following…")));
     if (!showing) return area.child(g);
@@ -1315,7 +1322,8 @@ export default class Dbx extends View {
             .when(tab?.kind === "console", (e) => e.child(this.consoleBody(tab, t)))
             .when(tab?.kind === "table", (e) => e.child(this.tableBody(tab, t)))
             .when(tab?.kind === "form", (e) => e.child(formBody(this, tab, t)))
-            .when(tab?.kind === "help", (e) => e.child(helpBody(t, this.font())))))))
+            .when(tab?.kind === "help", (e) => e.child(helpBody(t, this.font())))
+            .when(tab?.kind === "drift", (e) => e.child(driftBody(this, tab, t, this.font())))))))
       .when(Boolean(this.ctx), (e) => e.child(menuLayer(this, t, settings().zoom ?? 1)))
       .when(Boolean(this.toast), (e) => e.child(div().absolute().bottom(14).right(14).px(12).py(6).rounded(8).bg(t.popover).border_1().border_color(t.border).text_size(12).child(this.toast)));
   }

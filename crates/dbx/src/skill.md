@@ -10,6 +10,8 @@ worktrees). Use it instead of asking for credentials or reading them from files.
   saved query `.dbx/queries/<q>.sql` (look there first: they're the team's known-good queries). It goes through
   the user's dbx engine, so tunnels start by themselves, read-only rules apply, and the user sees what you ran
   (and that an agent ran it) in their panel's history.
+- `dbx drift <a> <b>` shows how two connections' schemas differ (missing migrations, say) and the SQL to align `b`.
+  Show it to the user rather than running it.
 - `dbx run <name> -- <command>` runs a command with the connection's variables set
   (`PGHOST`/`PGUSER`/`PGPASSWORD`/… or `CLICKHOUSE_*`, and `DATABASE_URL`), starting its tunnel
   (e.g. a kubectl port-forward) if it has one and stopping it afterwards. Examples:
