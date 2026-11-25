@@ -25,6 +25,8 @@ pub struct Pg {
     pub server_version: String,
     /// Single-column foreign keys by (table oid, column number), read once per catalog.
     fks: Option<HashMap<(u32, i16), Ref>>,
+    /// Table columns by (table oid, column number), as results meet them.
+    origins: HashMap<(u32, i16), Ref>,
 }
 
 #[derive(Serialize, Debug)]
@@ -35,6 +37,9 @@ pub struct Column {
     /// The row this column's value points at, when it comes from a foreign key column.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub refs: Option<Ref>,
+    /// The table column it is a copy of, when it is one (not an expression).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub origin: Option<Ref>,
 }
 
 /// A referenced column: `select * from schema.table where column = <value>` finds the row.
@@ -181,6 +186,7 @@ impl Pg {
             tls,
             server_version,
             fks: None,
+            origins: HashMap::new(),
         })
     }
 
@@ -312,16 +318,21 @@ impl Pg {
         );
         let prepared = self.client.prepare(&wrapped).ok()?;
         let fks = self.foreign_keys();
+        let keys: Vec<Option<(u32, i16)>> = prepared
+            .columns()
+            .iter()
+            .map(|c| c.table_oid().zip(c.column_id()))
+            .collect();
+        self.learn_origins(&keys);
         let columns = prepared
             .columns()
             .iter()
-            .map(|c| Column {
+            .zip(&keys)
+            .map(|(c, k)| Column {
                 name: c.name().into(),
                 ty: Some(c.type_().name().into()),
-                refs: c
-                    .table_oid()
-                    .zip(c.column_id())
-                    .and_then(|k| fks.get(&k).cloned()),
+                refs: k.and_then(|k| fks.get(&k).cloned()),
+                origin: k.and_then(|k| self.origins.get(&k).cloned()),
             })
             .collect();
         drop(prepared);
@@ -333,6 +344,40 @@ impl Pg {
             set.columns = columns;
             set
         }))
+    }
+
+    /// Names the table columns results come from (once per column per session).
+    fn learn_origins(&mut self, keys: &[Option<(u32, i16)>]) {
+        let unknown: Vec<(u32, i16)> = keys
+            .iter()
+            .flatten()
+            .filter(|k| !self.origins.contains_key(k))
+            .copied()
+            .collect();
+        if unknown.is_empty() {
+            return;
+        }
+        let oids: Vec<u32> = unknown.iter().map(|k| k.0).collect();
+        let nums: Vec<i16> = unknown.iter().map(|k| k.1).collect();
+        let Ok(rows) = self.client.query(
+            "select a.attrelid, a.attnum, n.nspname::text, c.relname::text, a.attname::text
+             from unnest($1::oid[], $2::int2[]) as k(rel, num)
+             join pg_attribute a on a.attrelid = k.rel and a.attnum = k.num
+             join pg_class c on c.oid = a.attrelid
+             join pg_namespace n on n.oid = c.relnamespace",
+            &[&oids, &nums],
+        ) else {
+            return;
+        };
+        for r in rows {
+            let key = (r.get::<_, u32>(0), r.get::<_, i16>(1));
+            let origin = Ref {
+                schema: r.get(2),
+                table: r.get(3),
+                column: r.get(4),
+            };
+            self.origins.insert(key, origin);
+        }
     }
 
     /// The database's single-column foreign keys (read once, and again with the catalog).
@@ -369,7 +414,7 @@ impl Pg {
     }
 
     /// The row `table.column = value` points at, with its own columns' references.
-    pub fn lookup(&mut self, target: &Ref, value: &str) -> Result<ResultSet> {
+    pub fn lookup(&mut self, target: &Ref, value: &str, limit: usize) -> Result<ResultSet> {
         let stmt = format!(
             "select * from {}.{} where {} = {}",
             quote_ident(&target.schema),
@@ -377,7 +422,72 @@ impl Pg {
             quote_ident(&target.column),
             quote_literal(value)
         );
-        match self.page(&stmt, 5, 0) {
+        match self.page(&stmt, limit, 0) {
+            Some(r) => Ok(r?),
+            None => anyhow::bail!("cannot look up {}.{}", target.schema, target.table),
+        }
+    }
+
+    /// The single-column foreign keys that point at `schema.table`, and how many rows each has
+    /// pointing at `row` (counted up to 1000; `more` past that).
+    pub fn referrers(
+        &mut self,
+        schema: &str,
+        table: &str,
+        row: &HashMap<String, Option<String>>,
+    ) -> Result<Vec<serde_json::Value>> {
+        let incoming = self.client.query(
+            "select n.nspname::text, s.relname::text, a.attname::text, t.attname::text
+             from pg_constraint c
+             join pg_class s on s.oid = c.conrelid
+             join pg_namespace n on n.oid = s.relnamespace
+             join pg_attribute a on a.attrelid = c.conrelid and a.attnum = c.conkey[1]
+             join pg_attribute t on t.attrelid = c.confrelid and t.attnum = c.confkey[1]
+             where c.contype = 'f' and cardinality(c.conkey) = 1
+               and c.confrelid = (quote_ident($1) || '.' || quote_ident($2))::regclass
+             order by s.relname, a.attname",
+            &[&schema, &table],
+        )?;
+        let mut out = Vec::new();
+        for r in incoming {
+            let (src_schema, src_table, column, target): (String, String, String, String) =
+                (r.get(0), r.get(1), r.get(2), r.get(3));
+            let Some(Some(value)) = row.get(&target) else {
+                continue;
+            };
+            let counted = self.client.query_one(
+                &format!(
+                    "select count(*) from (select 1 from {}.{} where {} = {} limit 1001) x",
+                    quote_ident(&src_schema),
+                    quote_ident(&src_table),
+                    quote_ident(&column),
+                    quote_literal(value)
+                ),
+                &[],
+            )?;
+            let count: i64 = counted.get(0);
+            out.push(serde_json::json!({
+                "schema": src_schema, "table": src_table, "column": column, "value": value,
+                "count": count.min(1000), "more": count > 1000,
+            }));
+        }
+        Ok(out)
+    }
+
+    /// The rows several values point at, in one query (a page's worth of hover cards).
+    pub fn lookup_many(&mut self, target: &Ref, values: &[String]) -> Result<ResultSet> {
+        let list: Vec<String> = values.iter().take(500).map(|v| quote_literal(v)).collect();
+        if list.is_empty() {
+            return Ok(ResultSet::default());
+        }
+        let stmt = format!(
+            "select * from {}.{} where {} in ({})",
+            quote_ident(&target.schema),
+            quote_ident(&target.table),
+            quote_ident(&target.column),
+            list.join(", ")
+        );
+        match self.page(&stmt, list.len(), 0) {
             Some(r) => Ok(r?),
             None => anyhow::bail!("cannot look up {}.{}", target.schema, target.table),
         }
@@ -550,6 +660,7 @@ fn collect(messages: Vec<SimpleQueryMessage>, limit: usize) -> Vec<ResultSet> {
                             name: c.name().into(),
                             ty: None,
                             refs: None,
+                            origin: None,
                         })
                         .collect(),
                     ..Default::default()

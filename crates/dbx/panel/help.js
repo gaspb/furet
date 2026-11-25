@@ -36,8 +36,10 @@ export const KEYS = [
     ["↑ ↓ ← →", "move the selected cell"],
     ["⌘ C", "copy the cell"],
     ["Enter · Delete", "edit the cell · mark the row for deletion (tables with a primary key)"],
-    ["Space", "preview the row a foreign key points at (again from there: nested) · Esc closes"],
-    ["Esc", "back to the editor"],
+    ["⌘ Enter · ⌘ click", "follow a foreign key: the results become the row it points at (on a trail)"],
+    ["r", "the rows pointing at the selected row (referenced by)"],
+    ["Esc", "back one step on the trail; with none, back to the editor"],
+    ["Space", "show or hide the row inspector"],
     ["⇧ Enter · right-click", "copy as JSON or CSV, filter by the value, set NULL…"],
   ]],
   ["Table view", [

@@ -164,7 +164,21 @@ pub struct LookupReq {
     pub schema: String,
     pub table: String,
     pub column: String,
-    pub value: String,
+    #[serde(default)]
+    pub value: Option<String>,
+    /// Several values at once: the rows they point at, in one query.
+    #[serde(default)]
+    pub values: Option<Vec<String>>,
+    #[serde(default)]
+    pub limit: Option<usize>,
+}
+
+#[derive(Deserialize)]
+pub struct ReferrersReq {
+    pub schema: String,
+    pub table: String,
+    /// The row: column name → value (as text).
+    pub row: HashMap<String, Option<String>>,
 }
 
 #[derive(Deserialize)]
@@ -575,12 +589,34 @@ impl Engine {
             table: req.table,
             column: req.column,
         };
-        let set = pg
+        let mut pg = pg.lock().unwrap();
+        let limit = req.limit.unwrap_or(500).clamp(1, 10_000);
+        let set = match (&req.value, &req.values) {
+            (_, Some(values)) => pg.lookup_many(&target, values),
+            (Some(value), None) => pg.lookup(&target, value, limit),
+            (None, None) => return fail(400, "give value or values"),
+        }
+        .map_err(|e| Fail(400, format!("{e:#}")))?;
+        Ok(serde_json::to_value(set)?)
+    }
+
+    /// The foreign keys pointing at a row, with how many rows each has there (Postgres).
+    pub fn referrers(
+        &self,
+        root: &std::path::Path,
+        id: &str,
+        req: ReferrersReq,
+    ) -> Result<Value, Fail> {
+        let s = self.session(root, id)?;
+        let Backend::Pg { pg, .. } = &s.backend else {
+            return fail(400, "ClickHouse has no foreign keys");
+        };
+        let out = pg
             .lock()
             .unwrap()
-            .lookup(&target, &req.value)
+            .referrers(&req.schema, &req.table, &req.row)
             .map_err(|e| Fail(400, format!("{e:#}")))?;
-        Ok(serde_json::to_value(set)?)
+        Ok(json!({ "referrers": out }))
     }
 
     /// Closes sessions idle for longer than `SESSION_IDLE` or whose connection dropped.

@@ -527,6 +527,7 @@ fn read_result(
                         name: unescape(v).unwrap_or_default(),
                         ty: types.next().and_then(unescape),
                         refs: None,
+                        origin: None,
                     })
                     .collect();
             } else {
@@ -534,6 +535,7 @@ fn read_result(
                     name: format.unwrap_or("result").to_string(),
                     ty: None,
                     refs: None,
+                    origin: None,
                 }];
                 first
                     .rows
