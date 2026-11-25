@@ -1,0 +1,4 @@
+# `cargo release patch|minor|major -p dbx --execute`: bumps dbx's version, commits, tags dbx-vX.Y.Z
+# and pushes. The tag triggers .github/workflows/release.yml (binaries, installer, GitHub Release).
+publish = false
+tag-name = "{{crate_name}}-v{{version}}"

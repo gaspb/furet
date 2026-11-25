@@ -230,6 +230,8 @@ pub fn serve(idle: Duration) -> Result<()> {
         eprintln!("dbx serve is already running");
         return Ok(());
     }
+    let _ = crate::panel::PANEL.refresh();
+    crate::update::watch();
     let server =
         Arc::new(Server::http("127.0.0.1:0").map_err(|e| anyhow::anyhow!("cannot listen: {e}"))?);
     let port = server
