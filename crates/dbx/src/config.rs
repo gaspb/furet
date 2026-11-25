@@ -64,6 +64,9 @@ pub struct Conn {
     /// Program to open instead of the default client; `{url}`, `{host}`… are filled in.
     pub client: Option<Vec<String>>,
     pub note: Option<String>,
+    /// Why it can't be reached (a container whose port isn't published); never in a file.
+    #[serde(skip)]
+    pub unreachable: Option<String>,
 }
 
 impl Conn {
@@ -202,6 +205,8 @@ pub struct Scope {
     pub layers: Vec<Layer>,
     pub entries: Vec<Entry>,
     pub clients: BTreeMap<String, Vec<String>>,
+    /// Why Docker couldn't be asked for running databases, when it couldn't.
+    pub docker: Option<String>,
 }
 
 impl Scope {
@@ -213,6 +218,7 @@ impl Scope {
             layers: Vec::new(),
             entries: Vec::new(),
             clients: BTreeMap::new(),
+            docker: None,
         };
         let mut seen = HashSet::new();
         s.add_project(&root, worktree.clone(), Origin::Project, &mut seen)?;
@@ -285,7 +291,9 @@ impl Scope {
             .last()
             .map(|l| l.base.clone())
             .unwrap_or_else(|| self.root.clone());
-        let found = crate::detect::running(&[&self.root, &worktree]);
+        let detection = crate::detect::running(&[&self.root, &worktree]);
+        self.docker = detection.problem;
+        let found = detection.found;
         if found.is_empty() {
             return self;
         }

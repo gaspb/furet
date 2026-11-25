@@ -76,12 +76,17 @@ Names resolve from this repo first, then included repos, then the global file.
 
 ## Databases running in Docker
 
-Running Postgres (postgres, postgis, timescale… images) and ClickHouse containers show up without configuring anything,
+Running Postgres and ClickHouse containers show up without configuring anything (any image: a container that exposes
+5432 or sets `PGDATA` is Postgres, one that exposes 8123 is ClickHouse),
 under `docker` in `dbx ls`, the picker and the panel. User, password and database come from the container's environment
 (`POSTGRES_USER`/`POSTGRES_PASSWORD`/`POSTGRES_DB`, `CLICKHOUSE_*`) each time; nothing is written. The address is the
 published port (`localhost:5433`), else the container's IP (Linux only). Containers from this repo's compose file
 (found from compose's labels, worktrees included) come first and go by their service name (`dbx run db -- psql`);
 others by their container name. A configured connection with the same name wins. `DBX_DOCKER=0` turns this off.
+`docker` is looked for on the PATH, then where Docker Desktop, Homebrew, OrbStack, Rancher Desktop and Colima install it
+(apps started from the Dock get a minimal PATH); `DBX_DOCKER_BIN` points at another one. When Docker can't be asked,
+`dbx ls` and the panel say why. A container whose port isn't published is listed with a note: it can't be reached
+from the host (except on Linux, through its container IP).
 
 ## Storage
 
