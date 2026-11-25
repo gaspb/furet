@@ -13,8 +13,11 @@ Related: [sidenote](https://github.com/gaspb/sidenote), per-repo scratch notes.
 ## Install
 
 ```sh
-cargo install --locked --git https://github.com/gaspb/tui-tools dbx
+curl -LsSf https://github.com/gaspb/tui-tools/releases/latest/download/dbx-installer.sh | sh
 ```
+
+macOS and Linux (Intel and ARM), into `~/.local/bin`. `dbx update` updates it later. From source:
+`cargo install --locked --git https://github.com/gaspb/tui-tools dbx`.
 
 ## License
 

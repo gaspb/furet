@@ -2,9 +2,11 @@ mod config;
 mod conn;
 mod detect;
 mod engine;
+mod panel;
 mod picker;
 mod store;
 mod tunnel;
+mod update;
 
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand, ValueEnum};
@@ -124,8 +126,10 @@ enum Cmd {
         #[arg(long)]
         global: bool,
     },
-    /// Set up an integration: `herdr` gives dbx its own name and icon in the herdr app
+    /// Set up an integration: `herdr` installs the panel and gives dbx its name and icon there
     Setup { target: Integration },
+    /// Update dbx (and the herdr panel with it)
+    Update,
     /// The local engine behind the herdr panel (127.0.0.1, token-protected)
     Serve {
         /// Start it in the background unless it's running; print its url and token as JSON
@@ -242,8 +246,18 @@ fn command(cmd: Cmd, cwd: &Path) -> Result<i32> {
                 tile: "#336791",
                 matches: &["dbx"],
             })?;
+            use common::herdr::Installed;
+            match panel::PANEL.install()? {
+                Installed::Written => {
+                    println!("installed the Databases panel (herdr loads it live)")
+                }
+                Installed::Unchanged => println!("the Databases panel is up to date"),
+                Installed::LeftAlone(why) => println!("left the Databases panel alone: {why}"),
+                Installed::NoHerdr => {}
+            }
             Ok(0)
         }
+        Cmd::Update => update::run(),
     }
 }
 

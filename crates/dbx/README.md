@@ -7,7 +7,8 @@ anything that isn't local opens read-only.
 ## Quick start
 
 ```sh
-cargo install --locked --git https://github.com/gaspb/tui-tools dbx
+curl -LsSf https://github.com/gaspb/tui-tools/releases/latest/download/dbx-installer.sh | sh
+dbx setup herdr         # if you use herdr: the Databases panel (optional)
 cd ~/src/my-api
 dbx add stg 'postgres://app:secret@localhost:15432/app' --stage stg \
   --tunnel 'kubectl -n stg port-forward svc/postgres 15432:5432'
@@ -32,7 +33,8 @@ dbx rm <name>           remove a connection (and its keychain password)
 dbx include <path>      also use another clone's connections
 dbx cp <name> --from <path> [--as <new>]
 dbx edit [--global]     open the connections file in $EDITOR
-dbx setup herdr         name and icon in the herdr app
+dbx setup herdr         the Databases panel, and dbx's name and icon in the herdr app
+dbx update              update dbx (the panel follows)
 dbx serve --ensure      the engine behind the herdr explorer (see below); --stop stops it
 ```
 
@@ -144,9 +146,14 @@ read-only on their own. For Claude Code, add to `~/.claude/CLAUDE.md`:
 
 ## herdr
 
-`dbx setup herdr` gives dbx panes their name and icon. The `dbx` mod in
-[herdr-mods](https://github.com/gaspb/herdr-mods) is a database explorer (tree, consoles, table data
-and structure) for the space's repo, running on `dbx serve`.
+`dbx setup herdr` installs the Databases panel (in `panel/`, carried by the binary so it always matches the
+engine) and gives dbx panes their name and icon. Open it from the command palette: **Databases**. It's a database
+explorer for the space's repo, on `dbx serve`; the panel's own guide is in
+[herdr-mods](https://github.com/gaspb/herdr-mods#dbx).
+
+Updates: the engine looks for a newer release twice a day (`DBX_NO_UPDATE_CHECK=1` turns that off) and the panel
+offers **Update**, which runs `dbx update`. After an update, the engine refreshes the panel it installed; herdr
+reloads it live. A panel folder you linked or made yourself is left alone.
 
 ## Engine: `dbx serve`
 
