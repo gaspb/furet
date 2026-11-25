@@ -1,5 +1,6 @@
 mod config;
 mod conn;
+mod detect;
 mod engine;
 mod picker;
 mod store;
@@ -166,7 +167,7 @@ fn run(cli: Cli) -> Result<i32> {
     }
     let cwd = cwd()?;
     match (cli.cmd, cli.name) {
-        (None, Some(name)) => open(&Scope::load(&cwd)?, &name, cli.write, None),
+        (None, Some(name)) => open(&Scope::load_for(&cwd, &name)?, &name, cli.write, None),
         (None, None) => pick(&cwd),
         (Some(cmd), _) => command(cmd, &cwd),
     }
@@ -175,25 +176,25 @@ fn run(cli: Cli) -> Result<i32> {
 fn command(cmd: Cmd, cwd: &Path) -> Result<i32> {
     match cmd {
         Cmd::List { all, json } => list(cwd, all, json),
-        Cmd::Open { name, write } => open(&Scope::load(cwd)?, &name, write, None),
+        Cmd::Open { name, write } => open(&Scope::load_for(cwd, &name)?, &name, write, None),
         Cmd::Run { name, write, argv } => {
-            let scope = Scope::load(cwd)?;
+            let scope = Scope::load_for(cwd, &name)?;
             let (r, _tunnel) = prepare(&scope, &name, write)?;
             exec(&r, &argv)
         }
         Cmd::Url { name, write } => {
-            let scope = Scope::load(cwd)?;
+            let scope = Scope::load_for(cwd, &name)?;
             println!("{}", resolve(&scope, &name, write)?.url());
             Ok(0)
         }
         Cmd::Env { name, write } => {
-            let scope = Scope::load(cwd)?;
+            let scope = Scope::load_for(cwd, &name)?;
             for (k, v) in resolve(&scope, &name, write)?.env() {
                 println!("export {k}='{}'", v.replace('\'', r"'\''"));
             }
             Ok(0)
         }
-        Cmd::Tunnel { name } => keep_tunnel(&Scope::load(cwd)?, &name),
+        Cmd::Tunnel { name } => keep_tunnel(&Scope::load_for(cwd, &name)?, &name),
         Cmd::Add {
             name,
             url,
@@ -409,6 +410,8 @@ pub struct Row {
     pub tunnel: bool,
     pub tunnel_up: Option<bool>,
     pub note: Option<String>,
+    /// Running in Docker, not configured: nothing to edit or remove, but it can be saved.
+    pub detected: bool,
 }
 
 pub fn rows(scope: &Scope) -> Vec<Row> {
@@ -429,6 +432,7 @@ pub fn rows(scope: &Scope) -> Vec<Row> {
                 readonly: c.readonly(),
                 endpoint: conn::endpoint(c),
                 source: scope.layer(e).label(),
+                detected: scope.layer(e).origin == config::Origin::Detected,
                 tunnel: c.tunnel.is_some(),
                 tunnel_up: c
                     .tunnel
@@ -456,7 +460,7 @@ fn list(cwd: &Path, all: bool, json: bool) -> Result<i32> {
         v.push(("global".into(), g));
         v
     } else {
-        let s = Scope::load(cwd)?;
+        let s = Scope::load(cwd)?.with_detected();
         vec![(tilde(&s.root), s)]
     };
     if json {
@@ -540,7 +544,7 @@ fn pick(cwd: &Path) -> Result<i32> {
     let mut tunnels = Vec::new();
     let mut message: Option<String> = None;
     loop {
-        let scope = Scope::load(cwd);
+        let scope = Scope::load(cwd).map(Scope::with_detected);
         let rows = scope.as_ref().map(rows).unwrap_or_default();
         if let Err(e) = &scope {
             message = Some(format!("{e:#}"));

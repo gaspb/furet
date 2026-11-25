@@ -171,6 +171,16 @@ extern "C" fn stop_tunnels_and_die(sig: libc::c_int) {
     }
 }
 
+/// Stops every tunnel this process started (on the way out, whoever still holds them).
+pub fn stop_all() {
+    for slot in &GROUPS {
+        let pgid = slot.swap(0, Ordering::SeqCst);
+        if pgid > 0 {
+            unsafe { libc::kill(-pgid, libc::SIGTERM) };
+        }
+    }
+}
+
 /// Ctrl-C, a closed pane or a kill stops dbx's tunnels instead of leaving them running.
 pub fn stop_tunnels_on_exit_signals() {
     for sig in [libc::SIGINT, libc::SIGTERM, libc::SIGHUP] {

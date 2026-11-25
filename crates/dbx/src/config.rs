@@ -161,6 +161,8 @@ pub enum Origin {
     Project,
     Include,
     Global,
+    /// Running in Docker right now, not configured anywhere.
+    Detected,
 }
 
 #[derive(Debug)]
@@ -177,6 +179,7 @@ impl Layer {
     pub fn label(&self) -> String {
         match (self.origin, &self.root) {
             (Origin::Global, _) => "global".into(),
+            (Origin::Detected, _) => "docker".into(),
             (Origin::Project, _) => "this repo".into(),
             (Origin::Include, Some(root)) => tilde(root),
             (Origin::Include, None) => "?".into(),
@@ -273,6 +276,46 @@ impl Scope {
                 });
             }
         }
+    }
+
+    /// Adds the databases running in Docker, under names nothing configured uses.
+    pub fn with_detected(mut self) -> Scope {
+        let worktree = self
+            .layers
+            .last()
+            .map(|l| l.base.clone())
+            .unwrap_or_else(|| self.root.clone());
+        let found = crate::detect::running(&[&self.root, &worktree]);
+        if found.is_empty() {
+            return self;
+        }
+        let idx = self.layers.len();
+        self.layers.push(Layer {
+            origin: Origin::Detected,
+            root: None,
+            file: PathBuf::new(),
+            base: worktree,
+        });
+        for f in found {
+            if !self.entries.iter().any(|e| e.name == f.name) {
+                self.entries.push(Entry {
+                    name: f.name,
+                    layer: idx,
+                    conn: f.conn,
+                });
+            }
+        }
+        self
+    }
+
+    /// The scope to find `name` in: Docker is only asked when nothing configured has that name.
+    pub fn load_for(cwd: &Path, name: &str) -> Result<Scope> {
+        let s = Scope::load(cwd)?;
+        Ok(if s.entries.iter().any(|e| e.name == name) {
+            s
+        } else {
+            s.with_detected()
+        })
     }
 
     pub fn get(&self, name: &str) -> Result<&Entry> {

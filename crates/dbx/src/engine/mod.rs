@@ -135,7 +135,7 @@ fn check_write(name: &str, prod: bool, write: bool, confirm: Option<&str>) -> Re
 
 impl Engine {
     pub fn connections(&self, cwd: &str) -> Result<Value, Fail> {
-        let scope = Scope::load(std::path::Path::new(cwd))?;
+        let scope = Scope::load(std::path::Path::new(cwd))?.with_detected();
         let sessions = self.sessions.lock().unwrap();
         let mut rows = serde_json::to_value(crate::rows(&scope))?;
         for row in rows.as_array_mut().into_iter().flatten() {
@@ -163,7 +163,7 @@ impl Engine {
     }
 
     pub fn draft(&self, cwd: &str, name: &str) -> Result<Value, Fail> {
-        let scope = Scope::load(std::path::Path::new(cwd))?;
+        let scope = Scope::load_for(std::path::Path::new(cwd), name)?;
         let d = store::draft_of(&scope, name).map_err(|e| Fail(400, format!("{e:#}")))?;
         Ok(serde_json::to_value(d)?)
     }
@@ -218,7 +218,7 @@ impl Engine {
     }
 
     pub fn open(&self, req: OpenReq) -> Result<Value, Fail> {
-        let scope = Scope::load(&req.cwd)?;
+        let scope = Scope::load_for(&req.cwd, &req.name)?;
         let entry = scope
             .get(&req.name)
             .map_err(|e| Fail(404, format!("{e:#}")))?;
@@ -314,7 +314,10 @@ impl Engine {
     pub fn session(&self, id: &str) -> Result<Arc<Session>, Fail> {
         let s = self.sessions.lock().unwrap().get(id).cloned();
         let Some(s) = s else {
-            return fail(404, "no such session (disconnected, or idle for 30 minutes)");
+            return fail(
+                404,
+                "no such session (disconnected, or idle for 30 minutes)",
+            );
         };
         s.touch();
         Ok(s)
@@ -408,6 +411,12 @@ impl Engine {
             let alive = s.pg.try_lock().map(|pg| !pg.is_closed()).unwrap_or(true);
             idle && alive
         });
+    }
+
+    /// Closes every session; their tunnels stop with them.
+    pub fn close_all(&self) {
+        self.sessions.lock().unwrap().clear();
+        self.tunnels.lock().unwrap().clear();
     }
 
     pub fn session_count(&self) -> usize {

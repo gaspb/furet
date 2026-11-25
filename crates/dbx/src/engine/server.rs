@@ -240,6 +240,9 @@ pub fn serve(idle: Duration) -> Result<()> {
             break;
         }
     }
+    // Request threads may still hold sessions: stop the tunnels by process group as well.
+    engine.close_all();
+    crate::tunnel::stop_all();
     if read_info().is_some_and(|i| i.pid == std::process::id()) {
         let _ = fs::remove_file(info_file());
     }
