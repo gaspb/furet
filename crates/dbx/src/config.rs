@@ -53,6 +53,8 @@ pub struct Conn {
     pub url: Option<Value>,
     pub host: Option<Value>,
     pub port: Option<u16>,
+    /// ClickHouse's HTTP port, used by `dbx serve` (`port` is the native one).
+    pub http_port: Option<u16>,
     pub user: Option<Value>,
     pub password: Option<Value>,
     pub database: Option<Value>,

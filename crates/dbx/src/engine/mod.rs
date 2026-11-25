@@ -1,5 +1,6 @@
 //! `dbx serve`: a local engine holding database sessions for the herdr panel, over HTTP on 127.0.0.1.
 
+pub mod ch;
 pub mod pg;
 pub mod server;
 pub mod sql;
@@ -39,19 +40,62 @@ pub struct Session {
     pub root: PathBuf,
     pub prod: bool,
     pub info: Value,
-    pg: Mutex<pg::Pg>,
-    cancel: (
-        postgres::CancelToken,
-        tokio_postgres_rustls::MakeRustlsConnect,
-    ),
+    backend: Backend,
     readonly: AtomicBool,
     last_used: Mutex<Instant>,
     _tunnel: Option<Arc<Tunnel>>,
 }
 
+enum Backend {
+    Pg {
+        pg: Box<Mutex<pg::Pg>>,
+        cancel: (
+            postgres::CancelToken,
+            tokio_postgres_rustls::MakeRustlsConnect,
+        ),
+    },
+    Ch(ch::Ch),
+}
+
+impl Backend {
+    fn connect(r: &conn::Resolved) -> anyhow::Result<Backend> {
+        Ok(match r.kind {
+            Kind::Postgres => {
+                let pg = pg::Pg::connect(r)?;
+                Backend::Pg {
+                    cancel: pg.cancel_token(),
+                    pg: Box::new(Mutex::new(pg)),
+                }
+            }
+            Kind::Clickhouse => Backend::Ch(ch::Ch::connect(r)?),
+        })
+    }
+
+    fn server_version(&self) -> String {
+        match self {
+            Backend::Pg { pg, .. } => pg.lock().unwrap().server_version.clone(),
+            Backend::Ch(ch) => ch.server_version.clone(),
+        }
+    }
+
+    fn describe(&self) -> String {
+        match self {
+            Backend::Pg { .. } => format!("Postgres {}", self.server_version()),
+            Backend::Ch(_) => format!("ClickHouse {}", self.server_version()),
+        }
+    }
+}
+
 impl Session {
     fn touch(&self) {
         *self.last_used.lock().unwrap() = Instant::now();
+    }
+
+    fn dialect(&self) -> sql::Dialect {
+        match self.backend {
+            Backend::Pg { .. } => sql::Dialect::Postgres,
+            Backend::Ch(_) => sql::Dialect::Clickhouse,
+        }
     }
 
     fn describe(&self) -> Value {
@@ -123,6 +167,14 @@ fn random_id() -> String {
     server::random_hex(8)
 }
 
+/// The port the engine connects to, which a tunnel must make reachable: ClickHouse's HTTP one.
+fn engine_port(r: &conn::Resolved) -> u16 {
+    match r.kind {
+        Kind::Postgres => r.port,
+        Kind::Clickhouse => r.http_port,
+    }
+}
+
 fn check_write(name: &str, prod: bool, write: bool, confirm: Option<&str>) -> Result<(), Fail> {
     if write && prod && confirm != Some(name) {
         return fail(
@@ -187,21 +239,11 @@ impl Engine {
         let layer = &scope.layers[0];
         let r = conn::resolve(&entry, layer).map_err(|e| Fail(400, format!("{e:#}")))?;
         let _tunnel = match &entry.conn.tunnel {
-            Some(cmd) => self.tunnel(cmd, &r.host, r.port, &layer.base)?,
+            Some(cmd) => self.tunnel(cmd, &r.host, engine_port(&r), &layer.base)?,
             None => None,
         };
-        if r.kind == Kind::Clickhouse {
-            let up = crate::tunnel::is_up(&r.host, r.port);
-            return Ok(json!({ "ok": up, "message": if up {
-                format!("{}:{} answers (the panel can't open ClickHouse sessions yet)", r.host, r.port)
-            } else {
-                format!("nothing answers on {}:{}", r.host, r.port)
-            }}));
-        }
-        match pg::Pg::connect(&r) {
-            Ok(pg) => Ok(
-                json!({ "ok": true, "message": format!("Connected · Postgres {}", pg.server_version) }),
-            ),
+        match Backend::connect(&r) {
+            Ok(b) => Ok(json!({ "ok": true, "message": format!("Connected · {}", b.describe()) })),
             Err(e) => Ok(json!({ "ok": false, "message": format!("{e:#}") })),
         }
     }
@@ -232,34 +274,20 @@ impl Engine {
             req.write,
             req.confirm.as_deref(),
         )?;
-        if entry.conn.kind() == Some(Kind::Clickhouse) {
-            return fail(
-                501,
-                format!(
-                    "{} is clickhouse: only Postgres is supported in the panel so far",
-                    req.name
-                ),
-            );
-        }
         let mut r = conn::resolve(entry, layer)?;
-        if r.kind != Kind::Postgres {
-            return fail(
-                501,
-                format!(
-                    "{} is {}: only Postgres is supported in the panel so far",
-                    req.name,
-                    r.kind.name()
-                ),
-            );
-        }
         if req.write {
             r.readonly = false;
         }
         let tunnel = match &entry.conn.tunnel {
-            Some(cmd) => self.tunnel(cmd, &r.host, r.port, &layer.base)?,
+            Some(cmd) => self.tunnel(cmd, &r.host, engine_port(&r), &layer.base)?,
             None => None,
         };
-        let pg = pg::Pg::connect(&r).map_err(|e| Fail(502, format!("{e:#}")))?;
+        let backend = Backend::connect(&r).map_err(|e| Fail(502, format!("{e:#}")))?;
+        if let Backend::Ch(ch) = &backend
+            && ch.server_readonly
+        {
+            r.readonly = true;
+        }
         let info = json!({
             "name": req.name,
             "kind": r.kind.name(),
@@ -269,7 +297,7 @@ impl Engine {
             "user": r.user,
             "host": r.host,
             "port": r.port,
-            "server_version": pg.server_version,
+            "server_version": backend.server_version(),
             "cwd": req.cwd,
         });
         let s = Arc::new(Session {
@@ -278,8 +306,7 @@ impl Engine {
             root: scope.root.clone(),
             prod: prod && readonly_default,
             info,
-            cancel: pg.cancel_token(),
-            pg: Mutex::new(pg),
+            backend,
             readonly: AtomicBool::new(r.readonly),
             last_used: Mutex::new(Instant::now()),
             _tunnel: tunnel,
@@ -351,16 +378,19 @@ impl Engine {
         } else if let Some((a, b)) = req.selection.filter(|(a, b)| a != b) {
             (clamp(a.min(b)), clamp(a.max(b)))
         } else {
-            match sql::at(sql, clamp(req.cursor.unwrap_or(0))) {
+            match sql::at(sql, clamp(req.cursor.unwrap_or(0)), s.dialect()) {
                 Some(r) => r,
                 None => return fail(400, "nothing to run"),
             }
         };
         let limit = req.limit.unwrap_or(500).clamp(1, 10_000);
-        let out =
-            s.pg.lock()
+        let out = match &s.backend {
+            Backend::Pg { pg, .. } => pg
+                .lock()
                 .unwrap()
-                .run(sql, range, req.all, limit, req.offset);
+                .run(sql, range, req.all, limit, req.offset),
+            Backend::Ch(ch) => ch.run(sql, range, limit, req.offset),
+        };
         if out.error.as_ref().is_some_and(|e| e.closed) {
             self.sessions.lock().unwrap().remove(id);
         }
@@ -369,22 +399,35 @@ impl Engine {
 
     pub fn cancel(&self, id: &str) -> Result<Value, Fail> {
         let s = self.session(id)?;
-        let (token, tls) = s.cancel.clone();
-        token.cancel_query(tls)?;
+        match &s.backend {
+            Backend::Pg { cancel, .. } => {
+                let (token, tls) = cancel.clone();
+                token.cancel_query(tls)?;
+            }
+            Backend::Ch(ch) => ch.cancel()?,
+        }
         Ok(json!({ "cancelled": id }))
     }
 
     pub fn mode(&self, id: &str, req: ModeReq) -> Result<Value, Fail> {
         let s = self.session(id)?;
         check_write(&s.name, s.prod, req.write, req.confirm.as_deref())?;
-        s.pg.lock().unwrap().set_readonly(!req.write)?;
+        match &s.backend {
+            Backend::Pg { pg, .. } => pg.lock().unwrap().set_readonly(!req.write)?,
+            Backend::Ch(ch) => ch
+                .set_readonly(!req.write)
+                .map_err(|e| Fail(409, format!("{e:#}")))?,
+        }
         s.readonly.store(!req.write, Ordering::SeqCst);
         Ok(s.describe())
     }
 
     pub fn catalog(&self, id: &str) -> Result<Value, Fail> {
         let s = self.session(id)?;
-        Ok(s.pg.lock().unwrap().catalog()?)
+        Ok(match &s.backend {
+            Backend::Pg { pg, .. } => pg.lock().unwrap().catalog()?,
+            Backend::Ch(ch) => ch.catalog()?,
+        })
     }
 
     pub fn apply(&self, id: &str, req: ApplyReq) -> Result<Value, Fail> {
@@ -392,7 +435,13 @@ impl Engine {
         if req.statements.is_empty() {
             return fail(400, "nothing to apply");
         }
-        Ok(match s.pg.lock().unwrap().apply(&req.statements) {
+        let Backend::Pg { pg, .. } = &s.backend else {
+            return fail(
+                400,
+                "ClickHouse changes rows with asynchronous mutations (ALTER TABLE … UPDATE/DELETE): run them from a console",
+            );
+        };
+        Ok(match pg.lock().unwrap().apply(&req.statements) {
             Ok(n) => json!({ "applied": n }),
             Err((index, message)) => {
                 json!({ "applied": 0, "error": { "index": index, "message": message } })
@@ -402,14 +451,20 @@ impl Engine {
 
     pub fn table(&self, id: &str, schema: &str, name: &str) -> Result<Value, Fail> {
         let s = self.session(id)?;
-        Ok(s.pg.lock().unwrap().table(schema, name)?)
+        Ok(match &s.backend {
+            Backend::Pg { pg, .. } => pg.lock().unwrap().table(schema, name)?,
+            Backend::Ch(ch) => ch.table(schema, name)?,
+        })
     }
 
     /// Closes sessions idle for longer than `SESSION_IDLE` or whose connection dropped.
     pub fn sweep(&self) {
         self.sessions.lock().unwrap().retain(|_, s| {
             let idle = s.last_used.lock().unwrap().elapsed() < SESSION_IDLE;
-            let alive = s.pg.try_lock().map(|pg| !pg.is_closed()).unwrap_or(true);
+            let alive = match &s.backend {
+                Backend::Pg { pg, .. } => pg.try_lock().map(|pg| !pg.is_closed()).unwrap_or(true),
+                Backend::Ch(_) => true,
+            };
             idle && alive
         });
     }

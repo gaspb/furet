@@ -44,7 +44,8 @@ port = 19000
 user = "readonly"
 password = { env = "CH_PROD_PASSWORD" }
 database = "events"
-tunnel = "kubectl -n prod port-forward svc/clickhouse 19000:9000"
+http_port = 18123                   # the panel's engine talks HTTP: forward that port too
+tunnel = "kubectl -n prod port-forward svc/clickhouse 19000:9000 18123:8123"
 stage = "prod"
 ```
 
@@ -56,8 +57,11 @@ stage = "prod"
   Relative paths and commands start from the current worktree (from the included repo, for its connections).
 - `tunnel` runs before connecting, unless the port already answers (a tunnel from another pane is reused),
   and is stopped when the client exits. In the picker it stays up until you quit.
+- ClickHouse: `port` is the native port (9000), for `clickhouse-client`; `http_port` (8123, 8443 with
+  `?secure=1`, or `?http_port=` in the URL) is the HTTP one, used by `dbx serve`. A `tunnel` should forward both.
 - `stage`: `local`, `dev` and `test` are writable; anything else is read-only unless `readonly = false`.
-  Postgres sessions get `default_transaction_read_only`, ClickHouse `readonly=1`. `-w` lifts it,
+  Postgres sessions get `default_transaction_read_only`, ClickHouse `readonly=1` (`readonly=2` in the
+  engine, which lets queries keep their `SETTINGS` but not lower `readonly`). `-w` lifts it,
   and on `prod` asks you to type the connection's name. It is a guard against mistakes, not a permission system:
   use a read-only database user for that.
 - `client = ["pgcli"]` picks another program; `{url}`, `{host}`, `{port}`, `{user}`, `{password}`, `{database}`
@@ -80,7 +84,7 @@ Running Postgres and ClickHouse containers show up without configuring anything 
 5432 or sets `PGDATA` is Postgres, one that exposes 8123 is ClickHouse),
 under `docker` in `dbx ls`, the picker and the panel. User, password and database come from the container's environment
 (`POSTGRES_USER`/`POSTGRES_PASSWORD`/`POSTGRES_DB`, `CLICKHOUSE_*`) each time; nothing is written. The address is the
-published port (`localhost:5433`), else the container's IP (Linux only). Containers from this repo's compose file
+published port (`localhost:5433`; for ClickHouse 9000's, and 8123's as `http_port`), else the container's IP (Linux only). Containers from this repo's compose file
 (found from compose's labels, worktrees included) come first and go by their service name (`dbx run db -- psql`);
 others by their container name. A configured connection with the same name wins. `DBX_DOCKER=0` turns this off.
 `docker` is looked for on the PATH, then where Docker Desktop, Homebrew, OrbStack, Rancher Desktop and Colima install it
@@ -114,7 +118,7 @@ and structure) for the space's repo, running on `dbx serve`.
 A local server that holds database sessions for the explorer, using the same connections as the CLI.
 `dbx serve --ensure` starts it in the background if it isn't running (one per user) and prints
 `{url, token, …}`; it stops after an hour without requests and open sessions, and closes sessions
-idle for 30 minutes. Postgres only for now.
+idle for 30 minutes. Postgres and ClickHouse.
 
 - Listens on `127.0.0.1` on a random port. Every request needs `Authorization: Bearer <token>`
   and a `Host` of `127.0.0.1:<port>`, so web pages (including DNS rebinding) and other users can't
@@ -123,6 +127,10 @@ idle for 30 minutes. Postgres only for now.
 - Secrets (`env`, `dotenv`, `cmd`) are read by the engine when a session opens: `{ env = … }` sees
   the engine's environment (the herdr app's), not the terminal you typed in.
 - Read-only works as in the CLI; writes on prod need the connection's name in `confirm`.
+- ClickHouse goes through its HTTP interface (`http_port`), with a server-side session per panel session
+  (`USE` and `SET` last): statements run one request each, in order; cancel is `KILL QUERY`; rows aren't
+  edited from the panel (ClickHouse changes them with asynchronous `ALTER TABLE … UPDATE/DELETE` mutations).
+  System databases are left out of the tree, unless the connection's database is one.
 
 | | |
 | --- | --- |
@@ -130,4 +138,5 @@ idle for 30 minutes. Postgres only for now.
 | `POST /sessions` `{cwd, name, write?, confirm?}` | connect (starting the tunnel) |
 | `POST /sessions/:id/query` `{sql, cursor?, selection?, all?, limit?, offset?}` | run the statement under the cursor, the selection, or all; a lone read-only statement is paged with column types |
 | `POST /sessions/:id/cancel` · `/mode` `{write, confirm?}` · `DELETE /sessions/:id` | |
-| `GET /sessions/:id/catalog` · `/table?schema=&name=` | schemas, tables and columns; one table's columns, indexes, constraints |
+| `GET /sessions/:id/catalog` · `/table?schema=&name=` | schemas, tables and columns; one table's columns, indexes, constraints (ClickHouse: databases; engine, keys, skipping indexes and `create`) |
+| `POST /sessions/:id/apply` `{statements}` | row edits in one transaction (Postgres) |
