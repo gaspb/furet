@@ -329,8 +329,7 @@ impl Scope {
         }
     }
 
-    /// Adds the databases running in Docker, under names nothing configured uses. Only those this
-    /// repo's compose files started come with their password; others need Save… first.
+    /// Adds the databases running in Docker, under names nothing configured uses.
     pub fn with_detected(mut self) -> Scope {
         let worktree = self
             .layers
@@ -364,17 +363,10 @@ impl Scope {
             if self.entries.iter().any(|e| e.name == name) {
                 continue;
             }
-            let mut conn = f.conn.clone();
-            if !f.here {
-                conn.password = None;
-                conn.unreachable.get_or_insert_with(|| {
-                    "this repo's compose files didn't start it: save it to this repo first (Save… in the panel)".into()
-                });
-            }
             self.entries.push(Entry {
                 name,
                 layer: idx,
-                conn,
+                conn: f.conn.clone(),
             });
         }
         self

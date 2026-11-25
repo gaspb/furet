@@ -58,7 +58,7 @@ stage = "prod"
 - `tunnel` runs before connecting, unless the port already answers (a tunnel from another pane is reused),
   and is stopped when the client exits. In the picker it stays up until you quit.
 - ClickHouse: `port` is the native port (9000), for `clickhouse-client`; `http_port` (8123, 8443 with
-  `?secure=1`, or `?http_port=` in the URL) is the HTTP one, used by `dbx serve`. A `tunnel` should forward both.
+  `?secure=1`, or `?http_port=` in the URL) is the HTTP one, used by `dbx serve` (the panel). A `tunnel` forwards the one you use: HTTP for the panel, native for the client.
 - `stage`: `local`, `dev` and `test` are writable; anything else is read-only unless `readonly = false`.
   Postgres sessions get `default_transaction_read_only`, ClickHouse `readonly=1` (`readonly=2` in the
   engine, which lets queries keep their `SETTINGS` but not lower `readonly`). `-w` lifts it,
@@ -88,9 +88,9 @@ under `docker` in `dbx ls`, the picker and the panel. User, password and databas
 (`POSTGRES_USER`/`POSTGRES_PASSWORD`/`POSTGRES_DB`, `CLICKHOUSE_*`) each time; nothing is written. The address is the
 published port (`localhost:5433`; for ClickHouse 9000's, and 8123's as `http_port`), else the container's IP (Linux only). Containers from this repo's compose file
 (compose's labels put its working directory and compose files inside the repo, worktrees included) come first and
-go by their service name (`dbx run db -- psql`), with their password. Others are listed by container name without
-it: Save… one to use it from this repo, which reads its password then, into the keychain. A configured
-connection with the same name wins, and the container goes by its container name. `DBX_DOCKER=0` turns this off.
+go by their service name (`dbx run db -- psql`); others by their container name. Save… stores one in this repo,
+its password read by dbx into the keychain. A configured connection with the same name wins, and the container
+goes by its container name. `DBX_DOCKER=0` turns this off.
 `docker` is looked for on the PATH, then where Docker Desktop, Homebrew, OrbStack, Rancher Desktop and Colima install it
 (apps started from the Dock get a minimal PATH); `DBX_DOCKER_BIN` points at another one. When Docker can't be asked,
 `dbx ls` and the panel say why. A container whose port isn't published is listed with a note: it can't be reached
