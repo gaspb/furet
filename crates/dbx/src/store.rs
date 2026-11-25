@@ -217,6 +217,18 @@ fn split_password(raw: &str) -> Result<(String, Option<String>)> {
 pub fn draft_of(scope: &Scope, name: &str) -> Result<Draft> {
     let e = scope.get(name)?;
     let c = &e.conn;
+    if scope.layer(e).origin == config::Origin::Detected {
+        // Saving a container's connection: start from where it is, password included (it goes to
+        // the keychain on save, out of the URL).
+        let r = crate::conn::resolve(e, scope.layer(e))?;
+        return Ok(Draft {
+            name: name.into(),
+            url: r.url(),
+            stage: Some("local".into()),
+            note: c.note.clone(),
+            ..Draft::default()
+        });
+    }
     let url = match &c.url {
         Some(Value::Plain(u)) => split_password(u)
             .map(|(u, _)| u)
@@ -405,6 +417,9 @@ pub fn remove(cwd: &Path, name: &str) -> Result<PathBuf> {
     let scope = Scope::load(cwd)?;
     let e = scope.get(name)?;
     let layer = scope.layer(e);
+    if layer.origin == config::Origin::Detected {
+        bail!("{name} is running in Docker, not saved anywhere: nothing to remove");
+    }
     if layer.origin == config::Origin::Include {
         bail!("{name} comes from {}: remove it there", layer.label());
     }

@@ -26,6 +26,24 @@ pub struct Info {
     pub token: String,
     pub pid: u32,
     pub version: String,
+    /// Which binary is serving: a reinstall (same version, new build) restarts it.
+    #[serde(default)]
+    pub build: String,
+}
+
+/// This binary's identity: its modification time and size.
+fn build_id() -> String {
+    std::env::current_exe()
+        .and_then(std::fs::metadata)
+        .map(|m| {
+            let t = m
+                .modified()
+                .ok()
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map_or(0, |d| d.as_secs());
+            format!("{t}-{}", m.len())
+        })
+        .unwrap_or_default()
 }
 
 fn dir() -> PathBuf {
@@ -91,13 +109,21 @@ fn call(info: &Info, method: &str, path: &str) -> Option<(u16, String)> {
     Some((status, body))
 }
 
-fn running_version(info: &Info) -> Option<String> {
+/// The running server's version and build, if it answers.
+fn running(info: &Info) -> Option<(String, String)> {
     let (status, body) = call(info, "GET", "/health")?;
     if status != 200 {
         return None;
     }
     let v: Value = serde_json::from_str(&body).ok()?;
-    v["version"].as_str().map(String::from)
+    Some((
+        v["version"].as_str()?.to_string(),
+        v["build"].as_str().unwrap_or_default().to_string(),
+    ))
+}
+
+fn current(info: &Info) -> bool {
+    running(info).is_some_and(|(v, b)| v == VERSION && b == build_id())
 }
 
 pub fn stop() -> bool {
@@ -109,14 +135,11 @@ pub fn stop() -> bool {
 /// Prints the running server's address and token, starting one in the background if needed.
 pub fn ensure() -> Result<Info> {
     if let Some(info) = read_info() {
-        match running_version(&info) {
-            Some(v) if v == VERSION => return Ok(info),
+        match running(&info) {
+            Some(_) if current(&info) => return Ok(info),
             Some(_) => {
                 call(&info, "POST", "/shutdown");
-                wait_for(
-                    || running_version(&info).is_none(),
-                    "the old server to stop",
-                )?;
+                wait_for(|| running(&info).is_none(), "the old server to stop")?;
             }
             None => {}
         }
@@ -142,7 +165,7 @@ pub fn ensure() -> Result<Info> {
     let mut found = None;
     wait_for(
         || {
-            found = read_info().filter(|i| running_version(i).as_deref() == Some(VERSION));
+            found = read_info().filter(current);
             found.is_some()
         },
         "dbx serve to start",
@@ -196,6 +219,7 @@ pub fn serve(idle: Duration) -> Result<()> {
         token: random_hex(32),
         pid: std::process::id(),
         version: VERSION.into(),
+        build: build_id(),
     };
     write_info(&info)?;
     eprintln!(
@@ -240,6 +264,9 @@ pub fn serve(idle: Duration) -> Result<()> {
             break;
         }
     }
+    // Request threads may still hold sessions: stop the tunnels by process group as well.
+    engine.close_all();
+    crate::tunnel::stop_all();
     if read_info().is_some_and(|i| i.pid == std::process::id()) {
         let _ = fs::remove_file(info_file());
     }
@@ -296,7 +323,7 @@ fn respond(engine: &Engine, info: &Info, mut req: Request) -> bool {
         };
         match (&method, segments.as_slice()) {
             (Method::Get, ["health"]) => Ok(
-                json!({ "version": VERSION, "pid": info.pid, "sessions": engine.session_count() }),
+                json!({ "version": VERSION, "build": info.build, "pid": info.pid, "sessions": engine.session_count() }),
             ),
             (Method::Post, ["shutdown"]) => {
                 shutdown = true;
@@ -306,6 +333,12 @@ fn respond(engine: &Engine, info: &Info, mut req: Request) -> bool {
             (Method::Get, ["connections", "draft"]) => {
                 param("cwd").and_then(|c| param("name").and_then(|n| engine.draft(&c, &n)))
             }
+            (Method::Post, ["connections", "disconnect"]) => parse(&body)
+                .and_then(|v| {
+                    serde_json::from_value::<super::NameReq>(v)
+                        .map_err(|e| Fail(400, e.to_string()))
+                })
+                .and_then(|r| engine.disconnect(r)),
             (Method::Post, ["connections", what @ ("test" | "save")]) => parse(&body)
                 .and_then(|v| {
                     serde_json::from_value::<super::DraftReq>(v)
