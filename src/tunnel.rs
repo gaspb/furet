@@ -13,6 +13,24 @@ use std::time::{Duration, Instant};
 
 const START_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// The (local, remote) ports a tunnel command forwards: kubectl's `18123:8123`, ssh's
+/// `-L [addr:]18123:host:8123`.
+pub fn forwards(cmd: &str) -> Vec<(u16, u16)> {
+    cmd.split_whitespace()
+        .map(|w| w.trim_matches(['"', '\'']))
+        .filter_map(|w| {
+            let parts: Vec<&str> = w.split(':').collect();
+            let (local, remote) = match parts.as_slice() {
+                [l, r] => (*l, *r),
+                [l, _, r] => (*l, *r),
+                [_, l, _, r] => (*l, *r),
+                _ => return None,
+            };
+            Some((local.parse().ok()?, remote.parse().ok()?))
+        })
+        .collect()
+}
+
 pub fn is_up(host: &str, port: u16) -> bool {
     let Ok(addrs) = (host, port).to_socket_addrs() else {
         return false;
@@ -176,8 +194,22 @@ impl Tunnel {
                 );
             }
             if start.elapsed() > START_TIMEOUT {
+                let other: Vec<String> = forwards(cmd)
+                    .into_iter()
+                    .filter(|(local, _)| *local != port && is_up(host, *local))
+                    .map(|(local, remote)| format!("{local} (→ {remote})"))
+                    .collect();
+                let hint = if other.is_empty() {
+                    String::new()
+                } else {
+                    format!(
+                        "; the tunnel is up on {}: the connection's port (or ClickHouse's http_port) \
+                         should be that local port",
+                        other.join(", ")
+                    )
+                };
                 bail!(
-                    "{host}:{port} still unreachable after {}s{}",
+                    "{host}:{port} still unreachable after {}s{hint}{}",
                     START_TIMEOUT.as_secs(),
                     t.output()
                 );

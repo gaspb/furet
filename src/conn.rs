@@ -209,10 +209,27 @@ pub fn resolve(entry: &Entry, layer: &Layer) -> Result<Resolved> {
             .map(|i| r.params.remove(i).1)
             .and_then(|p| p.parse().ok());
         let secure = r.param("secure").is_some_and(|v| v == "1" || v == "true");
-        r.http_port = c
-            .http_port
-            .or(from_url)
-            .unwrap_or(if secure { 8443 } else { 8123 });
+        let (http, native) = if secure { (8443, 9440) } else { (8123, 9000) };
+        let tunnelled = c
+            .tunnel
+            .as_deref()
+            .map(crate::tunnel::forwards)
+            .unwrap_or_default();
+        let forwarded = |to: &[u16]| {
+            tunnelled
+                .iter()
+                .find(|(_, remote)| to.contains(remote))
+                .map(|f| f.0)
+        };
+        r.http_port = match c.http_port.or(from_url).or(forwarded(&[8123, 8443])) {
+            Some(p) => p,
+            // `clickhouse://host:8123` means HTTP, whatever the scheme says about the native port.
+            None if [8123, 8443].contains(&r.port) => std::mem::replace(&mut r.port, native),
+            None => http,
+        };
+        if r.port == r.http_port {
+            r.port = forwarded(&[9000, 9440]).unwrap_or(native);
+        }
     }
     Ok(r)
 }
@@ -485,6 +502,46 @@ mod tests {
         assert_eq!(resolve(&e, &l).unwrap().http_port, 9443);
         let (e, l) = entry(r#"url = "clickhouse://h/db?secure=1""#);
         assert_eq!(resolve(&e, &l).unwrap().http_port, 8443);
+    }
+
+    #[test]
+    fn clickhouse_http_port_from_the_tunnel_or_an_http_url_port() {
+        let ports = |toml: &str| {
+            let (e, l) = entry(toml);
+            let r = resolve(&e, &l).unwrap();
+            (r.port, r.http_port)
+        };
+        let k = r#"tunnel = "kubectl -n a port-forward svc/clickhouse 18123:8123""#;
+        assert_eq!(
+            ports(&format!(
+                "url = \"clickhouse://default@localhost:18123/db\"\n{k}"
+            )),
+            (9000, 18123)
+        );
+        assert_eq!(
+            ports(&format!("url = \"clickhouse://default@localhost/db\"\n{k}")),
+            (9000, 18123)
+        );
+        let both = r#"tunnel = "kubectl port-forward svc/ch 19000:9000 18123:8123""#;
+        assert_eq!(
+            ports(&format!(
+                "url = \"clickhouse://localhost:19000/db\"\n{both}"
+            )),
+            (19000, 18123)
+        );
+        let ssh = r#"tunnel = "ssh -N -L 127.0.0.1:18123:ch.internal:8123 bastion""#;
+        assert_eq!(
+            ports(&format!("url = \"clickhouse://localhost:18123\"\n{ssh}")),
+            (9000, 18123)
+        );
+        assert_eq!(
+            ports(r#"url = "clickhouse://localhost:8123/db""#),
+            (9000, 8123)
+        );
+        assert_eq!(
+            ports(r#"url = "clickhouse://localhost:19000/db""#),
+            (19000, 8123)
+        );
     }
 
     #[test]

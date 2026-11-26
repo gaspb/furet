@@ -31,3 +31,6 @@ Rules:
   keychain, not the file). Prefer secrets by
   reference (`password = { cmd = "…" }`, `{ env = "VAR" }`, `{ dotenv = ".env", key = "VAR" }`) in the
   file shown by `furet path`, rather than a password in the URL.
+- ClickHouse: furet talks to it over HTTP (8123). With a tunnel, forward to 8123 and put the local port in the url:
+  `furet add events 'clickhouse://default@localhost:18123/events' --tunnel 'kubectl -n x port-forward svc/clickhouse 18123:8123'`.
+  Forward 9000 too (`19000:9000`, and that port in the url) only if `clickhouse-client` should work.
