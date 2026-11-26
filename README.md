@@ -83,8 +83,7 @@ port = 19000
 user = "readonly"
 password = { env = "CH_PROD_PASSWORD" }
 database = "events"
-http_port = 18123                   # the panel's engine talks HTTP: forward that port too
-tunnel = "kubectl -n prod port-forward svc/clickhouse 19000:9000 18123:8123"
+tunnel = "kubectl -n prod port-forward svc/clickhouse 19000:9000 18123:8123"   # http_port: 18123, from the tunnel
 stage = "prod"
 ```
 
@@ -98,8 +97,11 @@ stage = "prod"
   belongs to the connection that started it: opening the same connection from another pane or repo reuses it.
   If the port is held by another connection's tunnel, or by a program furet didn't start, furet refuses rather than
   send your credentials there: give the tunnel another local port.
-- ClickHouse: `port` is the native port (9000), for `clickhouse-client`; `http_port` (8123, 8443 with
-  `?secure=1`, or `?http_port=` in the URL) is the HTTP one, used by `furet serve` (the panel). A `tunnel` forwards the one you use: HTTP for the panel, native for the client.
+- ClickHouse has two ports: the native one (9000) for `clickhouse-client`, and the HTTP one (8123, 8443 with
+  `?secure=1`) that `furet serve` (the panel, `furet query`) uses. The HTTP port is `http_port` (or `?http_port=` in
+  the URL); without it, furet takes the local side of a tunnel forwarding to 8123/8443 (`18123:8123`), then a URL
+  port of 8123/8443, then 8123. So `clickhouse://default@localhost:18123/db` with
+  `tunnel = "kubectl … port-forward svc/clickhouse 18123:8123"` just works.
 - `stage`: `local`, `dev` and `test` are writable; anything else is read-only unless `readonly = false`.
   Postgres sessions get `default_transaction_read_only`, ClickHouse `readonly=1` (`readonly=2` in the
   engine, which lets queries keep their `SETTINGS` but not lower `readonly`). `-w` lifts it,

@@ -1,6 +1,6 @@
 [package]
 name = "furet"
-version = "0.2.0"
+version = "0.3.0"
 description = "Postgres and ClickHouse per repo: tunnels, read-only remotes, rows you can follow, for you and your agents"
 keywords = ["postgres", "clickhouse", "cli", "tui", "database"]
 categories = ["command-line-utilities"]
