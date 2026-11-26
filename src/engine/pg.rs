@@ -23,8 +23,10 @@ pub struct Pg {
     cancel: CancelToken,
     tls: MakeRustlsConnect,
     pub server_version: String,
-    /// Single-column foreign keys by (table oid, column number), read once per catalog.
+    /// Single-column foreign keys by (table oid, column number), read once per catalog, then
+    /// the references guessed from column names (`tenant_id` → `tenants.id`).
     fks: Option<HashMap<(u32, i16), Ref>>,
+    guessed: Vec<(Ref, Ref)>,
     /// Table columns by (table oid, column number), as results meet them.
     origins: HashMap<(u32, i16), Ref>,
 }
@@ -42,15 +44,54 @@ pub struct Column {
     pub origin: Option<Ref>,
 }
 
+/// `<name>_id` columns without a foreign key, and the table they most likely mean: `<name>`,
+/// `<name>s`, `<name>es` or `<y→ies>`, whose one-column primary key is `id` or the same name, of
+/// the same type. One in the column's own schema wins; elsewhere it has to be the only one.
+const GUESSED_REFS: &str = "
+with pk as (
+  select c.conrelid as rel, a.attnum, a.attname::text as col, a.atttypid, cl.relname::text as tbl,
+         n.nspname::text as sch, cl.relnamespace as ns
+  from pg_constraint c
+  join pg_attribute a on a.attrelid = c.conrelid and a.attnum = c.conkey[1]
+  join pg_class cl on cl.oid = c.conrelid
+  join pg_namespace n on n.oid = cl.relnamespace
+  where c.contype = 'p' and cardinality(c.conkey) = 1
+), col as (
+  select a.attrelid as rel, a.attnum, a.attname::text as col, a.atttypid, cl.relnamespace as ns,
+         n.nspname::text as sch, cl.relname::text as tbl, left(a.attname, -3) as stem
+  from pg_attribute a
+  join pg_class cl on cl.oid = a.attrelid
+  join pg_namespace n on n.oid = cl.relnamespace
+  where a.attname like '%\\_id' and a.attnum > 0 and not a.attisdropped
+    and cl.relkind in ('r', 'p', 'v', 'm', 'f')
+    and n.nspname <> 'information_schema' and n.nspname not like 'pg\\_%'
+), matched as (
+  select col.rel, col.attnum, col.sch, col.tbl, col.col, pk.sch as to_sch, pk.tbl as to_tbl,
+         pk.col as to_col, pk.ns = col.ns as near,
+         count(*) over (partition by col.rel, col.attnum) as n
+  from col
+  join pk on pk.atttypid = col.atttypid
+    and (pk.col = 'id' or pk.col = col.col)
+    and not (pk.rel = col.rel and pk.attnum = col.attnum)
+    and pk.tbl in (col.stem, col.stem || 's', col.stem || 'es', regexp_replace(col.stem, 'y$', 'ies'))
+)
+select distinct on (rel, attnum) rel, attnum, sch, tbl, col, to_sch, to_tbl, to_col
+from matched
+where near or n = 1
+order by rel, attnum, near desc";
+
 /// A row as text, as Postgres sends it (null as None).
 pub type TextRow = Vec<Option<String>>;
 
 /// A referenced column: `select * from schema.table where column = <value>` finds the row.
-#[derive(Serialize, Debug, Clone)]
+#[derive(Serialize, Debug, Clone, Default)]
 pub struct Ref {
     pub schema: String,
     pub table: String,
     pub column: String,
+    /// No constraint says so: the column's name does (`tenant_id` and a `tenants` table).
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub guessed: bool,
 }
 
 #[derive(Serialize, Debug, Default)]
@@ -189,6 +230,7 @@ impl Pg {
             tls,
             server_version,
             fks: None,
+            guessed: Vec::new(),
             origins: HashMap::new(),
         })
     }
@@ -407,6 +449,7 @@ impl Pg {
                 schema: r.get(2),
                 table: r.get(3),
                 column: r.get(4),
+                ..Ref::default()
             };
             self.origins.insert(key, origin);
         }
@@ -426,7 +469,7 @@ impl Pg {
              where c.contype = 'f' and cardinality(c.conkey) = 1",
             &[],
         );
-        let fks: HashMap<(u32, i16), Ref> = rows
+        let mut fks: HashMap<(u32, i16), Ref> = rows
             .map(|rows| {
                 rows.iter()
                     .map(|r| {
@@ -435,12 +478,34 @@ impl Pg {
                             schema: r.get(2),
                             table: r.get(3),
                             column: r.get(4),
+                            ..Ref::default()
                         };
                         (key, target)
                     })
                     .collect()
             })
             .unwrap_or_default();
+        self.guessed.clear();
+        for r in self.client.query(GUESSED_REFS, &[]).unwrap_or_default() {
+            let key = (r.get::<_, u32>(0), r.get::<_, i16>(1));
+            if fks.contains_key(&key) {
+                continue;
+            }
+            let source = Ref {
+                schema: r.get(2),
+                table: r.get(3),
+                column: r.get(4),
+                guessed: true,
+            };
+            let target = Ref {
+                schema: r.get(5),
+                table: r.get(6),
+                column: r.get(7),
+                guessed: true,
+            };
+            fks.insert(key, target.clone());
+            self.guessed.push((source, target));
+        }
         self.fks = Some(fks.clone());
         fks
     }
@@ -480,10 +545,21 @@ impl Pg {
              order by s.relname, a.attname",
             &[&schema, &table],
         )?;
+        self.foreign_keys();
+        let declared = incoming
+            .iter()
+            .map(|r| (r.get(0), r.get(1), r.get(2), r.get(3), false));
+        let guessed = self
+            .guessed
+            .iter()
+            .filter(|(_, t)| t.schema == schema && t.table == table)
+            .map(|(s, t)| {
+                let (s, t) = (s.clone(), t.clone());
+                (s.schema, s.table, s.column, t.column, true)
+            });
+        let all: Vec<(String, String, String, String, bool)> = declared.chain(guessed).collect();
         let mut out = Vec::new();
-        for r in incoming {
-            let (src_schema, src_table, column, target): (String, String, String, String) =
-                (r.get(0), r.get(1), r.get(2), r.get(3));
+        for (src_schema, src_table, column, target, guessed) in all {
             let Some(Some(value)) = row.get(&target) else {
                 continue;
             };
@@ -500,7 +576,7 @@ impl Pg {
             let count: i64 = counted.get(0);
             out.push(serde_json::json!({
                 "schema": src_schema, "table": src_table, "column": column, "value": value,
-                "count": count.min(1000), "more": count > 1000,
+                "count": count.min(1000), "more": count > 1000, "guessed": guessed,
             }));
         }
         Ok(out)

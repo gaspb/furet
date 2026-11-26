@@ -655,6 +655,7 @@ impl Engine {
             schema: req.schema,
             table: req.table,
             column: req.column,
+            ..pg::Ref::default()
         };
         let mut pg = pg.lock().unwrap();
         let limit = req.limit.unwrap_or(500).clamp(1, 10_000);

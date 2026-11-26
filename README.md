@@ -190,6 +190,17 @@ engine) and gives furet panes their name and icon. Open it from the command pale
 explorer for the space's repo, on `furet serve`; the panel's own guide is in
 [herdr-mods](https://github.com/gaspb/herdr-mods#furet).
 
+### Following rows (Postgres)
+
+- Foreign-key values are underlined, and the header line says where they point (`uuid · → tenants`).
+- Hovering one shows the row it points at in a few words (`Tenant 1 · pro`).
+- Ctrl/Cmd+click, or Ctrl/Cmd+Enter, follows it. A trail above the grid (`invoices › tenants #199af313…`) leads back, and
+  Esc goes back one step.
+- The inspector beside the grid (Space) shows the selected row, where each key points, and what points at it.
+  `r` lists those referrers too.
+- Columns without a constraint are matched by name: `tenant_id` goes to `tenants.id` (or `tenant.id`) when that table's
+  primary key has the same type, preferring the column's own schema. These show as `→ tenants?`, and as "by name" among the referrers.
+
 Updates: the engine looks for a newer release twice a day (`FURET_NO_UPDATE_CHECK=1` turns that off) and the panel
 offers **Update**, which runs `furet update`. After an update, the engine refreshes the panel it installed; herdr
 reloads it live. A panel folder you linked or made yourself is left alone.
