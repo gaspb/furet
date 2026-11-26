@@ -104,4 +104,34 @@ impl Client {
             Some(json!({ "sql": sql, "cursor": cursor, "all": all, "limit": 1000, "by": "app" })),
         )
     }
+
+    /// The rows where `table.column` is `value` (or one of `values`), with their own references.
+    pub fn lookup(
+        &self,
+        session: &str,
+        target: &Value,
+        value: Option<&str>,
+        values: &[String],
+    ) -> Result<Value> {
+        let mut body = target.clone();
+        body["limit"] = json!(500);
+        match value {
+            Some(v) => body["value"] = json!(v),
+            None => body["values"] = json!(values),
+        }
+        self.engine.call(
+            "POST",
+            &format!("/sessions/{session}/lookup?{}", q(&self.cwd)),
+            Some(body),
+        )
+    }
+
+    /// The references pointing at a row of `schema.table`, each with a count.
+    pub fn referrers(&self, session: &str, schema: &str, table: &str, row: Value) -> Result<Value> {
+        self.engine.call(
+            "POST",
+            &format!("/sessions/{session}/referrers?{}", q(&self.cwd)),
+            Some(json!({ "schema": schema, "table": table, "row": row })),
+        )
+    }
 }

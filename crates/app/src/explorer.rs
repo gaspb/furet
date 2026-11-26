@@ -1,22 +1,25 @@
 //! The window: connections → schemas → tables on the left, a SQL editor over the results on the
 //! right. Cmd/Ctrl+Enter runs the statement under the cursor, with Shift everything; a table in
-//! the tree shows its first rows.
+//! the tree shows its first rows. Foreign keys lead to the rows they point at, and the inspector
+//! to the rows pointing back: each step goes on a trail, and Esc goes back.
 
 use crate::engine::{Client, Engine};
-use crate::results::{Results, Set};
+use crate::results::{self, Ref, Results, Set};
+use gpui_kit::base::actions::Cancel;
 use gpui_kit::base::{TreeEvent, TreeItem, TreeState};
 use gpui_kit::component::input::{Editor, EditorState};
 use gpui_kit::component::list::ListItem;
 use gpui_kit::component::resizable::{h_resizable, resizable_panel, v_resizable};
-use gpui_kit::component::table::{DataTable, TableState};
+use gpui_kit::component::table::{DataTable, TableEvent, TableState};
 use gpui_kit::component::tree::tree;
 use gpui_kit::component::{ActiveTheme as _, h_flex, v_flex};
 use gpui_kit::prelude::*;
 use gpui_kit::*;
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
+use std::rc::Rc;
 
-actions!(furet_app, [RunStatement, RunAll]);
+actions!(furet_app, [RunStatement, RunAll, Follow, ToggleInspector]);
 
 pub fn bind_keys(cx: &mut App) {
     cx.bind_keys([
@@ -24,7 +27,24 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("ctrl-enter", RunStatement, Some("FuretConsole")),
         KeyBinding::new("cmd-shift-enter", RunAll, Some("FuretConsole")),
         KeyBinding::new("ctrl-shift-enter", RunAll, Some("FuretConsole")),
+        KeyBinding::new("cmd-enter", Follow, Some("FuretResults")),
+        KeyBinding::new("ctrl-enter", Follow, Some("FuretResults")),
+        KeyBinding::new("space", ToggleInspector, Some("FuretResults")),
     ]);
+}
+
+enum Referrers {
+    Loading,
+    Found(Vec<Value>),
+    Failed(String),
+}
+
+/// What the results showed before a step: put back as it was by Esc or a crumb.
+struct Step {
+    set: Set,
+    summaries: HashMap<usize, HashMap<String, Option<String>>>,
+    here: Option<(Ref, String)>,
+    sel: Option<(usize, usize)>,
 }
 
 struct Conn {
@@ -48,6 +68,16 @@ pub struct Explorer {
     status: SharedString,
     error: Option<SharedString>,
     busy: bool,
+    /// The connection the shown results came from.
+    shown: Option<String>,
+    trail: Vec<Step>,
+    /// Where the shown rows were found, when they're a step away from the query's own.
+    here: Option<(Ref, String)>,
+    sel: Option<(usize, usize)>,
+    inspector: bool,
+    referrers: HashMap<usize, Referrers>,
+    /// Bumped whenever the results change, so late answers for older ones are dropped.
+    generation: u64,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -60,7 +90,28 @@ impl Explorer {
                 .line_number(true)
         });
         editor.update(cx, |e, cx| e.set_value("select 1;", window, cx));
-        let results = cx.new(|cx| TableState::new(Results::default(), window, cx));
+        let weak = cx.weak_entity();
+        let follow: results::Follow = Rc::new(move |row, col, window, cx| {
+            let _ = weak.update(cx, |this, cx| this.follow(row, col, window, cx));
+        });
+        let delegate = Results {
+            on_follow: Some(follow),
+            ..Results::default()
+        };
+        let results = cx.new(|cx| TableState::new(delegate, window, cx).cell_selectable(true));
+        let picked = cx.subscribe_in(
+            &results,
+            window,
+            |this, _, event: &TableEvent, window, cx| match *event {
+                TableEvent::SelectCell(row, col) => this.select(row, col, window, cx),
+                TableEvent::SelectRow(row) => {
+                    let col = this.sel.map_or(0, |(_, c)| c);
+                    this.select(row, col, window, cx)
+                }
+                TableEvent::DoubleClickedCell(row, col) => this.follow(row, col, window, cx),
+                _ => {}
+            },
+        );
         let subscription = cx.subscribe_in(
             &tree,
             window,
@@ -90,7 +141,14 @@ impl Explorer {
             status: "Starting the furet engine…".into(),
             error: None,
             busy: false,
-            _subscriptions: vec![subscription],
+            shown: None,
+            trail: Vec::new(),
+            here: None,
+            sel: None,
+            inspector: true,
+            referrers: HashMap::new(),
+            generation: 0,
+            _subscriptions: vec![subscription, picked],
         };
         this.load(window, cx);
         this
@@ -292,7 +350,7 @@ impl Explorer {
                 };
                 Ok((name, id.clone(), c.query(&id, &sql, cursor, all)?))
             },
-            |this, r, _, cx| {
+            |this, r, window, cx| {
                 this.busy = false;
                 match r {
                     Ok((name, id, out)) => {
@@ -314,10 +372,10 @@ impl Explorer {
                                 ),
                             };
                             this.status = format!("{name} · {shown} · {ms} ms").into();
-                            this.results.update(cx, |t, cx| {
-                                t.delegate_mut().set = set;
-                                t.refresh(cx);
-                            });
+                            this.trail.clear();
+                            this.here = None;
+                            this.shown = Some(name);
+                            this.show(set, HashMap::new(), None, window, cx);
                         }
                     }
                     Err(e) => this.error = Some(format!("{e:#}").into()),
@@ -328,6 +386,554 @@ impl Explorer {
 
     fn conn(&self, name: &str) -> Option<&Conn> {
         self.conns.iter().find(|c| c.name == name)
+    }
+
+    fn session(&self) -> Option<String> {
+        self.sessions.get(self.shown.as_ref()?).cloned()
+    }
+
+    /// Puts a result set on screen, then looks up what its foreign keys point at.
+    fn show(
+        &mut self,
+        set: Set,
+        summaries: HashMap<usize, HashMap<String, Option<String>>>,
+        sel: Option<(usize, usize)>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.generation += 1;
+        self.referrers.clear();
+        self.sel = sel;
+        self.results.update(cx, |t, cx| {
+            let d = t.delegate_mut();
+            d.set = set;
+            d.summaries = summaries;
+            t.refresh(cx);
+            if let Some((row, col)) = sel {
+                t.set_selected_cell(row, col, cx);
+            }
+        });
+        self.prefetch(window, cx);
+        if let Some((row, _)) = sel {
+            self.load_referrers(row, window, cx);
+        }
+        cx.notify();
+    }
+
+    fn prefetch(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(session) = self.session() else {
+            return;
+        };
+        let d = self.results.read(cx).delegate();
+        let wanted: Vec<(usize, Ref, Vec<String>)> = d
+            .set
+            .columns
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| !d.summaries.contains_key(i))
+            .filter_map(|(i, c)| {
+                let mut values: Vec<String> =
+                    d.set.rows.iter().filter_map(|r| r[i].clone()).collect();
+                values.sort();
+                values.dedup();
+                Some((i, c.refs.clone()?, values)).filter(|(_, _, v)| !v.is_empty())
+            })
+            .collect();
+        let generation = self.generation;
+        for (col, target, values) in wanted {
+            let session = session.clone();
+            self.background(
+                window,
+                cx,
+                move |c| {
+                    let got: Set = serde_json::from_value(c.lookup(
+                        &session,
+                        &serde_json::to_value(&target)?,
+                        None,
+                        &values,
+                    )?)?;
+                    let at = got.columns.iter().position(|x| x.name == target.column);
+                    let mut found: HashMap<String, Option<String>> =
+                        values.into_iter().map(|v| (v, None)).collect();
+                    for r in &got.rows {
+                        if let Some(Some(v)) = at.map(|i| &r[i]) {
+                            let words = results::summarize(&got.columns, r);
+                            let words = if words.is_empty() {
+                                format!("{} #{v}", target.table)
+                            } else {
+                                words
+                            };
+                            found.insert(v.clone(), Some(words));
+                        }
+                    }
+                    Ok(found)
+                },
+                move |this, r, _, cx| {
+                    if let (Ok(found), true) = (r, this.generation == generation) {
+                        this.results.update(cx, |t, cx| {
+                            t.delegate_mut().summaries.insert(col, found);
+                            t.refresh(cx);
+                        });
+                    }
+                },
+            );
+        }
+    }
+
+    fn select(&mut self, row: usize, col: usize, window: &mut Window, cx: &mut Context<Self>) {
+        self.sel = Some((row, col));
+        self.load_referrers(row, window, cx);
+        cx.notify();
+    }
+
+    /// Who points at a row, once per row: for each table its columns come from.
+    fn load_referrers(&mut self, row: usize, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.inspector || self.referrers.contains_key(&row) {
+            return;
+        }
+        let Some(session) = self.session() else {
+            return;
+        };
+        let set = &self.results.read(cx).delegate().set;
+        let Some(values) = set.rows.get(row) else {
+            return;
+        };
+        let mut tables: Vec<(String, String, serde_json::Map<String, Value>)> = Vec::new();
+        for (c, v) in set.columns.iter().zip(values) {
+            let Some(o) = &c.origin else { continue };
+            let at = match tables
+                .iter()
+                .position(|(s, t, _)| *s == o.schema && *t == o.table)
+            {
+                Some(at) => at,
+                None => {
+                    tables.push((o.schema.clone(), o.table.clone(), Default::default()));
+                    tables.len() - 1
+                }
+            };
+            tables[at].2.insert(o.column.clone(), serde_json::json!(v));
+        }
+        self.referrers.insert(row, Referrers::Loading);
+        let generation = self.generation;
+        self.background(
+            window,
+            cx,
+            move |c| {
+                let mut found = Vec::new();
+                for (schema, table, values) in tables {
+                    let out = c.referrers(&session, &schema, &table, Value::Object(values))?;
+                    found.extend(out["referrers"].as_array().cloned().unwrap_or_default());
+                }
+                Ok(found)
+            },
+            move |this, r, _, _| {
+                if this.generation == generation {
+                    let state = match r {
+                        Ok(found) => Referrers::Found(found),
+                        Err(e) => Referrers::Failed(format!("{e:#}")),
+                    };
+                    this.referrers.insert(row, state);
+                }
+            },
+        );
+    }
+
+    fn follow(&mut self, row: usize, col: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let set = &self.results.read(cx).delegate().set;
+        let target = set.columns.get(col).and_then(|c| c.refs.clone());
+        let value = set.rows.get(row).and_then(|r| r[col].clone());
+        match (target, value) {
+            (Some(target), Some(value)) => self.go(target, value, window, cx),
+            (Some(_), None) => self.say("null points at nothing", cx),
+            _ => {}
+        }
+    }
+
+    /// One step on: the rows of `target.table` whose `target.column` is `value`.
+    fn go(&mut self, target: Ref, value: String, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(session) = self.session() else {
+            return;
+        };
+        let label = results::step_label(&target.table, &target.column, &value);
+        self.status = format!("Opening {label}…").into();
+        self.background(
+            window,
+            cx,
+            move |c| {
+                let got = c.lookup(&session, &serde_json::to_value(&target)?, Some(&value), &[])?;
+                Ok((serde_json::from_value::<Set>(got)?, target, value))
+            },
+            move |this, r, window, cx| match r {
+                Ok((set, target, value)) => {
+                    let col = set
+                        .columns
+                        .iter()
+                        .position(|c| c.name == target.column)
+                        .unwrap_or(0);
+                    let sel = (!set.rows.is_empty()).then_some((0, col));
+                    this.status = format!(
+                        "{label} · {} row{}",
+                        set.rows.len(),
+                        if set.rows.len() == 1 { "" } else { "s" }
+                    )
+                    .into();
+                    let d = this.results.read(cx).delegate();
+                    this.trail.push(Step {
+                        set: d.set.clone(),
+                        summaries: d.summaries.clone(),
+                        here: this.here.take(),
+                        sel: this.sel,
+                    });
+                    this.here = Some((target, value));
+                    this.error = None;
+                    this.show(set, HashMap::new(), sel, window, cx);
+                    this.focus_results(window, cx);
+                }
+                Err(e) => this.error = Some(format!("{e:#}").into()),
+            },
+        );
+    }
+
+    /// Back one step, or to step `to` of the trail.
+    fn back(&mut self, to: Option<usize>, window: &mut Window, cx: &mut Context<Self>) {
+        let at = match to {
+            Some(at) if at < self.trail.len() => at,
+            None if !self.trail.is_empty() => self.trail.len() - 1,
+            _ => return,
+        };
+        let step = self.trail.drain(at..).next().unwrap();
+        self.here = step.here;
+        self.status = self
+            .label()
+            .unwrap_or_else(|| "Back to the results".into())
+            .into();
+        self.show(step.set, step.summaries, step.sel, window, cx);
+        self.focus_results(window, cx);
+    }
+
+    fn focus_results(&self, window: &mut Window, cx: &mut Context<Self>) {
+        let handle = self.results.read(cx).focus_handle(cx);
+        window.focus(&handle, cx);
+    }
+
+    fn label(&self) -> Option<String> {
+        let (r, v) = self.here.as_ref()?;
+        Some(results::step_label(&r.table, &r.column, v))
+    }
+
+    /// The current step as a query in the editor, to take it further by hand.
+    fn as_sql(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some((r, v)) = &self.here else { return };
+        let sql = format!(
+            "select * from \"{}\".\"{}\" where \"{}\" = '{}';",
+            r.schema,
+            r.table,
+            r.column,
+            v.replace('\'', "''")
+        );
+        self.editor.update(cx, |e, cx| e.set_value(sql, window, cx));
+    }
+
+    fn say(&mut self, text: &str, cx: &mut Context<Self>) {
+        self.status = text.to_string().into();
+        cx.notify();
+    }
+}
+
+impl Explorer {
+    /// The results, with the trail above them and the inspector beside them.
+    fn results_area(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = cx.theme().clone();
+        let table = v_flex()
+            .size_full()
+            .when(!self.trail.is_empty(), |e| e.child(self.trail_bar(cx)))
+            .child(
+                div()
+                    .flex_1()
+                    .min_h_0()
+                    .child(DataTable::new(&self.results)),
+            );
+        let body = match self.sel.filter(|_| self.inspector) {
+            Some((row, _)) => h_resizable("furet-results")
+                .child(resizable_panel().child(table))
+                .child(
+                    resizable_panel()
+                        .size(px(340.))
+                        .child(self.inspector(row, cx)),
+                )
+                .into_any_element(),
+            None => table.into_any_element(),
+        };
+        div()
+            .size_full()
+            .key_context("FuretResults")
+            .bg(theme.background)
+            .on_action(cx.listener(|this, _: &Follow, window, cx| {
+                if let Some((row, col)) = this.sel {
+                    this.follow(row, col, window, cx);
+                }
+            }))
+            .capture_action(cx.listener(|this, _: &Cancel, window, cx| {
+                if this.trail.is_empty() {
+                    cx.propagate();
+                } else {
+                    this.back(None, window, cx);
+                }
+            }))
+            .on_action(cx.listener(|this, _: &ToggleInspector, window, cx| {
+                this.inspector = !this.inspector;
+                if let Some((row, _)) = this.sel {
+                    this.load_referrers(row, window, cx);
+                }
+                cx.notify();
+            }))
+            .child(body)
+    }
+
+    fn trail_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = cx.theme().clone();
+        let crumb = |id: SharedString, text: String, current: bool| {
+            div()
+                .id(id)
+                .px_1p5()
+                .rounded_sm()
+                .flex_none()
+                .text_xs()
+                .text_color(if current {
+                    theme.foreground
+                } else {
+                    theme.blue
+                })
+                .when(current, |e| e.font_weight(FontWeight::SEMIBOLD))
+                .when(!current, |e| {
+                    e.cursor_pointer().hover(|s| s.bg(theme.muted))
+                })
+                .child(text)
+        };
+        let mut labels: Vec<String> = self
+            .trail
+            .iter()
+            .skip(1)
+            .filter_map(|s| s.here.as_ref())
+            .map(|(r, v)| results::step_label(&r.table, &r.column, v))
+            .collect();
+        labels.extend(self.label());
+        let mut bar = h_flex()
+            .h(px(30.))
+            .px_2()
+            .gap_1()
+            .items_center()
+            .border_b_1()
+            .border_color(theme.border)
+            .child(
+                crumb("furet-back".into(), "← Back".into(), false)
+                    .on_click(cx.listener(|this, _, window, cx| this.back(None, window, cx))),
+            )
+            .child(div().w(px(8.)))
+            .child(
+                crumb("furet-crumb-0".into(), "query".into(), false)
+                    .on_click(cx.listener(|this, _, window, cx| this.back(Some(0), window, cx))),
+            );
+        let last = labels.len().saturating_sub(1);
+        for (i, label) in labels.into_iter().enumerate() {
+            bar = bar
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(theme.muted_foreground)
+                        .child("›"),
+                )
+                .child(
+                    crumb(format!("furet-crumb-{}", i + 1).into(), label, i == last).when(
+                        i != last,
+                        |e| {
+                            e.on_click(cx.listener(move |this, _, window, cx| {
+                                this.back(Some(i + 1), window, cx)
+                            }))
+                        },
+                    ),
+                );
+        }
+        bar.child(div().flex_1()).child(
+            crumb("furet-as-sql".into(), "As SQL".into(), false)
+                .on_click(cx.listener(|this, _, window, cx| this.as_sql(window, cx))),
+        )
+    }
+
+    /// The selected row: its fields, where its keys point, and what points at it.
+    fn inspector(&self, row: usize, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = cx.theme().clone();
+        let d = self.results.read(cx).delegate();
+        let set = &d.set;
+        let table = set
+            .columns
+            .iter()
+            .find_map(|c| c.origin.as_ref().map(|o| o.table.clone()))
+            .unwrap_or_else(|| "row".into());
+        let mut list = v_flex()
+            .id("furet-inspector")
+            .size_full()
+            .overflow_y_scroll()
+            .border_l_1()
+            .border_color(theme.border)
+            .child(
+                div()
+                    .px_3()
+                    .py_2()
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .child(format!("{table} · row {}", row + 1)),
+            );
+        let Some(values) = set.rows.get(row) else {
+            return list;
+        };
+        for (i, (c, v)) in set.columns.iter().zip(values).enumerate() {
+            let link = c.refs.clone().zip(v.clone()).map(|(r, v)| {
+                let about = d.summary(row, i);
+                let text = [
+                    Some(results::arrow(&r)),
+                    about,
+                    r.guessed.then(|| "guessed from the name".to_string()),
+                ]
+                .into_iter()
+                .flatten()
+                .collect::<Vec<_>>()
+                .join(" · ");
+                (r, v, text)
+            });
+            list = list.child(
+                v_flex()
+                    .px_3()
+                    .py_1()
+                    .child(
+                        h_flex()
+                            .text_xs()
+                            .text_color(theme.muted_foreground)
+                            .child(div().flex_1().child(c.name.clone()))
+                            .child(c.ty.clone().unwrap_or_default()),
+                    )
+                    .child(
+                        div()
+                            .font_family(theme.mono_font_family.clone())
+                            .text_color(if v.is_none() {
+                                theme.muted_foreground
+                            } else {
+                                theme.foreground
+                            })
+                            .when(v.is_none(), |e| e.italic())
+                            .child(v.clone().unwrap_or_else(|| "null".into())),
+                    )
+                    .when_some(link, |e, (target, value, text)| {
+                        e.child(
+                            div()
+                                .id(("furet-insp-go", i))
+                                .text_xs()
+                                .text_color(theme.blue)
+                                .cursor_pointer()
+                                .hover(|s| s.underline())
+                                .on_click(cx.listener(move |this, _, window, cx| {
+                                    this.go(target.clone(), value.clone(), window, cx)
+                                }))
+                                .child(text),
+                        )
+                    }),
+            );
+        }
+        list = list.child(
+            div()
+                .px_3()
+                .pt_3()
+                .pb_1()
+                .text_xs()
+                .font_weight(FontWeight::SEMIBOLD)
+                .text_color(theme.muted_foreground)
+                .child("REFERENCED BY"),
+        );
+        match self.referrers.get(&row) {
+            None | Some(Referrers::Loading) => {
+                list = list.child(
+                    div()
+                        .px_3()
+                        .text_xs()
+                        .text_color(theme.muted_foreground)
+                        .child("…"),
+                )
+            }
+            Some(Referrers::Failed(e)) => {
+                list = list.child(
+                    div()
+                        .px_3()
+                        .text_xs()
+                        .text_color(theme.danger)
+                        .child(e.clone()),
+                )
+            }
+            Some(Referrers::Found(found)) if found.is_empty() => {
+                list = list.child(
+                    div()
+                        .px_3()
+                        .text_xs()
+                        .text_color(theme.muted_foreground)
+                        .child("Nothing points at this row"),
+                )
+            }
+            Some(Referrers::Found(found)) => {
+                for (i, x) in found.iter().enumerate() {
+                    let count = x["count"].as_u64().unwrap_or(0);
+                    let target = Ref {
+                        schema: x["schema"].as_str().unwrap_or("").into(),
+                        table: x["table"].as_str().unwrap_or("").into(),
+                        column: x["column"].as_str().unwrap_or("").into(),
+                        guessed: false,
+                    };
+                    let value = x["value"].as_str().unwrap_or("").to_string();
+                    let name = format!(
+                        "{}.{}{}",
+                        target.table,
+                        target.column,
+                        if x["guessed"].as_bool() == Some(true) {
+                            " (by name)"
+                        } else {
+                            ""
+                        }
+                    );
+                    let more = if x["more"].as_bool() == Some(true) {
+                        "+"
+                    } else {
+                        ""
+                    };
+                    let rows = match count {
+                        0 => "none".to_string(),
+                        1 => "1 row →".to_string(),
+                        n => format!("{n}{more} rows →"),
+                    };
+                    list = list.child(
+                        h_flex()
+                            .id(("furet-insp-ref", i))
+                            .px_3()
+                            .py_0p5()
+                            .text_xs()
+                            .when(count > 0, |e| {
+                                e.cursor_pointer().hover(|s| s.bg(theme.muted)).on_click(
+                                    cx.listener(move |this, _, window, cx| {
+                                        this.go(target.clone(), value.clone(), window, cx)
+                                    }),
+                                )
+                            })
+                            .child(div().flex_1().truncate().child(name))
+                            .child(
+                                div()
+                                    .text_color(if count > 0 {
+                                        theme.blue
+                                    } else {
+                                        theme.muted_foreground
+                                    })
+                                    .child(rows),
+                            ),
+                    );
+                }
+            }
+        }
+        list
     }
 }
 
@@ -443,7 +1049,7 @@ impl Render for Explorer {
                 div()
                     .text_xs()
                     .text_color(theme.muted_foreground)
-                    .child("⌘/Ctrl+Enter runs the statement · ⇧ runs all"),
+                    .child("⌘/Ctrl+Enter runs · ⇧ all · ⌘/Ctrl+click a key to follow · Esc back · Space inspector"),
             );
         let console = v_flex()
             .size_full()
@@ -460,7 +1066,7 @@ impl Render for Explorer {
                             .size(px(220.))
                             .child(Editor::new(&self.editor).h_full()),
                     )
-                    .child(resizable_panel().child(DataTable::new(&self.results))),
+                    .child(resizable_panel().child(self.results_area(cx))),
             );
         let status = h_flex()
             .h(px(26.))
