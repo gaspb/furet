@@ -2,7 +2,6 @@ mod config;
 mod conn;
 mod detect;
 mod engine;
-mod migrate;
 mod panel;
 mod picker;
 mod query;
@@ -181,7 +180,6 @@ enum Integration {
 
 fn main() {
     tunnel::stop_tunnels_on_exit_signals();
-    migrate::from_dbx();
     match run(Cli::parse()) {
         Ok(code) => std::process::exit(code),
         Err(e) => {
