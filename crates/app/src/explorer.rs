@@ -11,6 +11,7 @@ use gpui_kit::component::input::{Editor, EditorState, Input, InputEvent, InputSt
 use gpui_kit::component::list::ListItem;
 use gpui_kit::component::resizable::{h_resizable, resizable_panel, v_resizable};
 use gpui_kit::component::table::{DataTable, TableEvent, TableState};
+use gpui_kit::component::text::TextView;
 use gpui_kit::component::tree::tree;
 use gpui_kit::component::{ActiveTheme as _, Sizable as _, h_flex, v_flex};
 use gpui_kit::prelude::*;
@@ -1039,6 +1040,16 @@ fn pill(text: impl Into<SharedString>, color: Hsla) -> Div {
         .child(text.into())
 }
 
+/// Text that can be selected and copied, like an error.
+fn copyable(id: &'static str, text: &str) -> TextView {
+    let html = text
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('\n', "<br>");
+    TextView::html(id, html).selectable(true)
+}
+
 fn rows_label(n: i64) -> String {
     match n {
         n if n < 0 => String::new(),
@@ -1428,9 +1439,14 @@ impl Explorer {
                 .child(
                     h_flex()
                         .gap_2()
-                        .text_color(theme.danger)
-                        .font_weight(FontWeight::MEDIUM)
-                        .child(message.clone())
+                        .items_start()
+                        .child(
+                            div()
+                                .flex_1()
+                                .text_color(theme.danger)
+                                .font_weight(FontWeight::MEDIUM)
+                                .child(copyable("furet-error", message)),
+                        )
                         .child(
                             div()
                                 .text_xs()
@@ -1439,7 +1455,12 @@ impl Explorer {
                         ),
                 )
                 .when_some(detail.clone(), |e, d| {
-                    e.child(div().text_xs().text_color(theme.muted_foreground).child(d))
+                    e.child(
+                        div()
+                            .text_xs()
+                            .text_color(theme.muted_foreground)
+                            .child(copyable("furet-error-detail", &d)),
+                    )
                 })
                 .into_any_element(),
         })
