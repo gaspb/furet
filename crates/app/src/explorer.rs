@@ -7,12 +7,12 @@ use crate::engine::{Client, Engine};
 use crate::results::{self, Ref, Results, Set};
 use gpui_kit::base::actions::Cancel;
 use gpui_kit::base::{TreeEvent, TreeItem, TreeState};
-use gpui_kit::component::input::{Editor, EditorState};
+use gpui_kit::component::input::{Editor, EditorState, Input, InputEvent, InputState};
 use gpui_kit::component::list::ListItem;
 use gpui_kit::component::resizable::{h_resizable, resizable_panel, v_resizable};
 use gpui_kit::component::table::{DataTable, TableEvent, TableState};
 use gpui_kit::component::tree::tree;
-use gpui_kit::component::{ActiveTheme as _, h_flex, v_flex};
+use gpui_kit::component::{ActiveTheme as _, Sizable as _, h_flex, v_flex};
 use gpui_kit::prelude::*;
 use gpui_kit::*;
 use serde_json::Value;
@@ -52,6 +52,25 @@ struct Conn {
     stage: String,
     kind: String,
     endpoint: String,
+    prod: bool,
+}
+
+/// How the last run went, for the bar above the results.
+enum Outcome {
+    Rows {
+        rows: usize,
+        more: bool,
+        ms: u64,
+    },
+    Affected {
+        rows: u64,
+        ms: u64,
+    },
+    Failed {
+        message: String,
+        detail: Option<String>,
+        ms: u64,
+    },
 }
 
 pub struct Explorer {
@@ -68,6 +87,11 @@ pub struct Explorer {
     status: SharedString,
     error: Option<SharedString>,
     busy: bool,
+    outcome: Option<Outcome>,
+    /// Whether each open connection is read-only, as the engine last said.
+    modes: HashMap<String, bool>,
+    /// Typing a prod connection's name to allow writes.
+    confirm: Option<Entity<InputState>>,
     /// The connection the shown results came from.
     shown: Option<String>,
     trail: Vec<Step>,
@@ -103,12 +127,16 @@ impl Explorer {
             &results,
             window,
             |this, _, event: &TableEvent, window, cx| match *event {
-                TableEvent::SelectCell(row, col) => this.select(row, col, window, cx),
+                TableEvent::SelectCell(row, col) => {
+                    this.select(row, col.saturating_sub(results::NUMBERS), window, cx)
+                }
                 TableEvent::SelectRow(row) => {
                     let col = this.sel.map_or(0, |(_, c)| c);
                     this.select(row, col, window, cx)
                 }
-                TableEvent::DoubleClickedCell(row, col) => this.follow(row, col, window, cx),
+                TableEvent::DoubleClickedCell(row, col) if col >= results::NUMBERS => {
+                    this.follow(row, col - results::NUMBERS, window, cx)
+                }
                 _ => {}
             },
         );
@@ -127,6 +155,9 @@ impl Explorer {
                 }
             },
         );
+        let appearance = cx.observe_window_appearance(window, |_, window, cx| {
+            crate::look::follow_system(window, cx)
+        });
         let mut this = Self {
             client: None,
             cwd,
@@ -141,6 +172,9 @@ impl Explorer {
             status: "Starting the furet engine…".into(),
             error: None,
             busy: false,
+            outcome: None,
+            modes: HashMap::new(),
+            confirm: None,
             shown: None,
             trail: Vec::new(),
             here: None,
@@ -148,7 +182,7 @@ impl Explorer {
             inspector: true,
             referrers: HashMap::new(),
             generation: 0,
-            _subscriptions: vec![subscription, picked],
+            _subscriptions: vec![subscription, picked, appearance],
         };
         this.load(window, cx);
         this
@@ -205,14 +239,10 @@ impl Explorer {
                                 stage: c["stage"].as_str().unwrap_or("").into(),
                                 kind: c["kind"].as_str().unwrap_or("postgres").into(),
                                 endpoint: c["endpoint"].as_str().unwrap_or("").into(),
+                                prod: matches!(c["stage"].as_str(), Some("prod" | "production")),
                             })
                             .collect();
-                        this.status = format!(
-                            "{} connections · {}",
-                            this.conns.len(),
-                            conns["root"].as_str().unwrap_or("")
-                        )
-                        .into();
+                        this.status = format!("{} connections", this.conns.len()).into();
                         this.rebuild_tree(cx);
                     }
                     Err(e) => this.error = Some(format!("{e:#}").into()),
@@ -282,15 +312,24 @@ impl Explorer {
             window,
             cx,
             move |c| {
-                let id = match known {
-                    Some(id) => id,
-                    None => c.open(&name)?["id"].as_str().unwrap_or("").to_string(),
+                let (id, readonly) = match known {
+                    Some(id) => (id, None),
+                    None => {
+                        let s = c.open(&name)?;
+                        (
+                            s["id"].as_str().unwrap_or("").to_string(),
+                            s["readonly"].as_bool(),
+                        )
+                    }
                 };
                 let cat = c.catalog(&id)?;
-                Ok((name, id, cat))
+                Ok((name, id, cat, readonly))
             },
             |this, r, _, cx| match r {
-                Ok((name, id, cat)) => {
+                Ok((name, id, cat, readonly)) => {
+                    if let Some(ro) = readonly {
+                        this.modes.insert(name.clone(), ro);
+                    }
                     this.status = format!(
                         "{name} · {} tables",
                         cat["tables"].as_array().map_or(0, Vec::len)
@@ -309,7 +348,7 @@ impl Explorer {
     fn clicked(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
         let parts: Vec<&str> = id.splitn(4, ':').collect();
         match parts.as_slice() {
-            ["c", name] => self.current = Some(name.to_string()),
+            ["c", name] | ["s", name, ..] => self.current = Some(name.to_string()),
             ["t", name, schema, table] => {
                 self.current = Some(name.to_string());
                 let sql = format!("select * from \"{schema}\".\"{table}\" limit 200;");
@@ -355,23 +394,37 @@ impl Explorer {
                 match r {
                     Ok((name, id, out)) => {
                         this.sessions.insert(name.clone(), id);
+                        if let Some(ro) = out["readonly"].as_bool() {
+                            this.modes.insert(name.clone(), ro);
+                        }
                         let sets: Vec<Set> =
                             serde_json::from_value(out["results"].clone()).unwrap_or_default();
                         let ms = out["elapsed_ms"].as_u64().unwrap_or(0);
-                        this.error = out["error"]["message"]
-                            .as_str()
-                            .map(|m| SharedString::from(m.to_string()));
+                        this.error = None;
+                        this.status = format!("Ran on {name}").into();
+                        let failed = out["error"]["message"].as_str().map(|m| Outcome::Failed {
+                            message: m.to_string(),
+                            detail: ["detail", "hint"]
+                                .iter()
+                                .filter_map(|k| out["error"][k].as_str())
+                                .map(String::from)
+                                .reduce(|a, b| format!("{a}\n{b}")),
+                            ms,
+                        });
+                        this.outcome = failed;
                         if let Some(set) = sets.into_iter().last() {
-                            let shown = match set.affected {
-                                Some(n) if set.columns.is_empty() => format!("{n} rows affected"),
-                                _ => format!(
-                                    "{} row{}{}",
-                                    set.rows.len(),
-                                    if set.rows.len() == 1 { "" } else { "s" },
-                                    if set.more { "+" } else { "" }
-                                ),
-                            };
-                            this.status = format!("{name} · {shown} · {ms} ms").into();
+                            if this.outcome.is_none() {
+                                this.outcome = Some(match set.affected {
+                                    Some(rows) if set.columns.is_empty() => {
+                                        Outcome::Affected { rows, ms }
+                                    }
+                                    _ => Outcome::Rows {
+                                        rows: set.rows.len(),
+                                        more: set.more,
+                                        ms,
+                                    },
+                                });
+                            }
                             this.trail.clear();
                             this.here = None;
                             this.shown = Some(name);
@@ -410,7 +463,7 @@ impl Explorer {
             d.summaries = summaries;
             t.refresh(cx);
             if let Some((row, col)) = sel {
-                t.set_selected_cell(row, col, cx);
+                t.set_selected_cell(row, col + results::NUMBERS, cx);
             }
         });
         self.prefetch(window, cx);
@@ -642,16 +695,32 @@ impl Explorer {
 
 impl Explorer {
     /// The results, with the trail above them and the inspector beside them.
-    fn results_area(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    fn results_area(&self, cx: &mut Context<Self>) -> AnyElement {
         let theme = cx.theme().clone();
+        if self.results.read(cx).delegate().set.columns.is_empty() {
+            return v_flex()
+                .size_full()
+                .items_center()
+                .justify_center()
+                .gap_2()
+                .text_color(theme.muted_foreground)
+                .child(icon("furet/table.svg", theme.muted_foreground).size(px(28.)))
+                .child(match &self.outcome {
+                    Some(Outcome::Failed { .. }) => "Nothing to show",
+                    Some(Outcome::Affected { .. }) => "The statement returned no rows",
+                    _ => "Pick a table on the left, or write a query and press ⌘/Ctrl+↵",
+                })
+                .into_any_element();
+        }
         let table = v_flex()
             .size_full()
             .when(!self.trail.is_empty(), |e| e.child(self.trail_bar(cx)))
             .child(
-                div()
-                    .flex_1()
-                    .min_h_0()
-                    .child(DataTable::new(&self.results)),
+                div().flex_1().min_h_0().child(
+                    DataTable::new(&self.results)
+                        .with_size(gpui_kit::component::Size::Size(px(24.)))
+                        .header_row_height(px(38.)),
+                ),
             );
         let body = match self.sel.filter(|_| self.inspector) {
             Some((row, _)) => h_resizable("furet-results")
@@ -688,6 +757,7 @@ impl Explorer {
                 cx.notify();
             }))
             .child(body)
+            .into_any_element()
     }
 
     fn trail_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -814,6 +884,7 @@ impl Explorer {
                     .child(
                         div()
                             .font_family(theme.mono_font_family.clone())
+                            .text_size(theme.mono_font_size)
                             .text_color(if v.is_none() {
                                 theme.muted_foreground
                             } else {
@@ -947,11 +1018,113 @@ fn stage_color(stage: &str, cx: &App) -> Hsla {
     }
 }
 
-impl Render for Explorer {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+fn kind_icon(kind: &str) -> (&'static str, Hsla) {
+    match kind {
+        "clickhouse" => ("furet/clickhouse.svg", rgb(0xd4a20b).into()),
+        _ => ("furet/postgres.svg", rgb(0x4169e1).into()),
+    }
+}
+
+fn icon(path: &'static str, color: Hsla) -> Svg {
+    svg().path(path).size(px(14.)).flex_none().text_color(color)
+}
+
+/// The stage, in its colour, as the herdr panel shows it.
+fn pill(text: impl Into<SharedString>, color: Hsla) -> Div {
+    div()
+        .text_size(px(11.))
+        .font_weight(FontWeight::MEDIUM)
+        .text_color(color)
+        .flex_none()
+        .child(text.into())
+}
+
+fn rows_label(n: i64) -> String {
+    match n {
+        n if n < 0 => String::new(),
+        n if n < 1000 => n.to_string(),
+        n if n < 1_000_000 => format!("{:.1}k", n as f64 / 1e3),
+        n => format!("{:.1}M", n as f64 / 1e6),
+    }
+}
+
+impl Explorer {
+    fn toggle_mode(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(name) = self.current.clone() else {
+            return;
+        };
+        let readonly = self.modes.get(&name).copied().unwrap_or(true);
+        let prod = self.conn(&name).is_some_and(|c| c.prod);
+        if readonly && prod {
+            let input = cx.new(|cx| {
+                InputState::new(window, cx).placeholder(format!("Type {name} to allow writes"))
+            });
+            let sub = cx.subscribe_in(
+                &input,
+                window,
+                |this, input, ev: &InputEvent, window, cx| match ev {
+                    InputEvent::PressEnter { .. } => {
+                        let typed = input.read(cx).value().to_string();
+                        if let Some(name) = this.current.clone() {
+                            this.set_mode(name, true, Some(typed), window, cx);
+                        }
+                    }
+                    InputEvent::Blur => {
+                        this.confirm = None;
+                        cx.notify();
+                    }
+                    _ => {}
+                },
+            );
+            self._subscriptions.push(sub);
+            input.update(cx, |i, cx| i.focus(window, cx));
+            self.confirm = Some(input);
+            cx.notify();
+            return;
+        }
+        self.set_mode(name, readonly, None, window, cx);
+    }
+
+    fn set_mode(
+        &mut self,
+        name: String,
+        write: bool,
+        confirm: Option<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let known = self.sessions.get(&name).cloned();
+        self.background(
+            window,
+            cx,
+            move |c| {
+                let id = match known {
+                    Some(id) => id,
+                    None => c.open(&name)?["id"].as_str().unwrap_or("").to_string(),
+                };
+                let out = c.mode(&id, write, confirm.as_deref())?;
+                Ok((name, id, out["readonly"].as_bool().unwrap_or(!write)))
+            },
+            |this, r, _, _| match r {
+                Ok((name, id, readonly)) => {
+                    this.confirm = None;
+                    this.status = format!(
+                        "{name} is {}",
+                        if readonly { "read-only" } else { "read-write" }
+                    )
+                    .into();
+                    this.sessions.insert(name.clone(), id);
+                    this.modes.insert(name, readonly);
+                }
+                Err(e) => this.error = Some(format!("{e:#}").into()),
+            },
+        );
+    }
+
+    fn sidebar(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme().clone();
         let view = cx.entity().downgrade();
-        let stages: HashMap<String, (String, String, String)> = self
+        let conns: HashMap<String, (String, String, String)> = self
             .conns
             .iter()
             .map(|c| {
@@ -961,96 +1134,321 @@ impl Render for Explorer {
                 )
             })
             .collect();
-        let sidebar = v_flex()
+        let sizes: HashMap<String, i64> = self
+            .catalogs
+            .iter()
+            .flat_map(|(conn, cat)| {
+                cat["tables"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .map(move |t| {
+                        (
+                            format!(
+                                "t:{conn}:{}:{}",
+                                t["schema"].as_str().unwrap_or(""),
+                                t["name"].as_str().unwrap_or("")
+                            ),
+                            t["rows"].as_i64().unwrap_or(-1),
+                        )
+                    })
+            })
+            .collect();
+        let repo = std::path::Path::new(&self.cwd)
+            .file_name()
+            .map_or(self.cwd.clone(), |n| n.to_string_lossy().into_owned());
+        v_flex()
             .size_full()
             .bg(theme.sidebar)
             .child(
                 h_flex()
-                    .h(px(36.))
+                    .h(px(44.))
                     .px_3()
+                    .gap_2()
                     .items_center()
-                    .font_weight(FontWeight::SEMIBOLD)
-                    .child("Databases"),
+                    .border_b_1()
+                    .border_color(theme.sidebar_border)
+                    .child(icon("furet/database.svg", theme.muted_foreground))
+                    .child(div().font_weight(FontWeight::SEMIBOLD).child("Databases"))
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(theme.muted_foreground)
+                            .truncate()
+                            .child(repo),
+                    ),
             )
             .child(
                 tree(&self.tree, move |ix, entry, selected, _, cx| {
                     let item = entry.item();
                     let id = item.id.to_string();
+                    let t = cx.theme().clone();
                     let view = view.clone();
                     let depth = entry.depth();
-                    let (label, suffix): (String, Option<(String, Hsla)>) =
-                        match id.split(':').next() {
-                            Some("c") => {
-                                let (stage, kind, endpoint) =
-                                    stages.get(item.label.as_ref()).cloned().unwrap_or_default();
-                                (
-                                    format!("{}  {kind} · {endpoint}", item.label),
-                                    Some((stage.clone(), stage_color(&stage, cx))),
+                    let chevron = if !entry.is_folder() {
+                        div().w(px(12.)).flex_none().into_any_element()
+                    } else {
+                        icon(
+                            if entry.is_expanded() {
+                                "icons/chevron-down.svg"
+                            } else {
+                                "icons/chevron-right.svg"
+                            },
+                            t.muted_foreground,
+                        )
+                        .size(px(12.))
+                        .into_any_element()
+                    };
+                    let row = h_flex().w_full().gap_2().items_center().child(chevron);
+                    let row = match id.split(':').next() {
+                        Some("c") => {
+                            let (stage, kind, endpoint) =
+                                conns.get(item.label.as_ref()).cloned().unwrap_or_default();
+                            let (path, color) = kind_icon(&kind);
+                            row.child(icon(path, color))
+                                .child(
+                                    div()
+                                        .font_weight(FontWeight::MEDIUM)
+                                        .flex_none()
+                                        .child(item.label.clone()),
                                 )
-                            }
-                            _ => (item.label.to_string(), None),
-                        };
+                                .child(
+                                    div()
+                                        .flex_1()
+                                        .min_w_0()
+                                        .truncate()
+                                        .text_xs()
+                                        .text_color(t.muted_foreground)
+                                        .child(endpoint),
+                                )
+                                .when(!stage.is_empty(), |e| {
+                                    e.child(pill(stage.clone(), stage_color(&stage, cx)))
+                                })
+                        }
+                        Some("s") => row
+                            .child(icon(
+                                if entry.is_expanded() {
+                                    "icons/folder-open.svg"
+                                } else {
+                                    "icons/folder.svg"
+                                },
+                                t.muted_foreground,
+                            ))
+                            .child(div().flex_1().truncate().child(item.label.clone())),
+                        Some("t") => {
+                            row.child(icon("furet/table.svg", t.muted_foreground))
+                                .child(div().flex_1().truncate().child(item.label.clone()))
+                                .child(div().text_xs().text_color(t.muted_foreground).child(
+                                    sizes.get(&id).map_or(String::new(), |n| rows_label(*n)),
+                                ))
+                        }
+                        _ => row.child(
+                            div()
+                                .text_xs()
+                                .italic()
+                                .text_color(t.muted_foreground)
+                                .child("connecting…"),
+                        ),
+                    };
                     ListItem::new(ix)
                         .selected(selected)
-                        .pl(px(8. + depth as f32 * 14.))
-                        .child(
-                            h_flex()
-                                .w_full()
-                                .gap_2()
-                                .child(div().text_color(cx.theme().muted_foreground).child(
-                                    if entry.is_folder() {
-                                        if entry.is_expanded() { "▾" } else { "▸" }
-                                    } else {
-                                        "▦"
-                                    },
-                                ))
-                                .child(div().flex_1().truncate().child(label))
-                                .when_some(suffix, |e, (stage, color)| {
-                                    e.child(div().text_xs().text_color(color).child(stage))
-                                }),
-                        )
+                        .h(px(24.))
+                        .pl(px(6. + depth as f32 * 14.))
+                        .pr_2()
+                        .child(row)
                         .on_click(move |_, window, cx| {
                             let _ = view.update(cx, |this, cx| this.clicked(&id, window, cx));
                         })
                 })
                 .flex_1(),
-            );
+            )
+    }
+
+    fn toolbar(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = cx.theme().clone();
         let current = self.current.clone().unwrap_or_default();
-        let stage = self
-            .conn(&current)
-            .map(|c| c.stage.clone())
-            .unwrap_or_default();
-        let toolbar = h_flex()
-            .h(px(36.))
+        let conn = self.conn(&current);
+        let readonly = self.modes.get(&current).copied();
+        let button = |id: &'static str, label: &'static str, primary: bool| {
+            h_flex()
+                .id(id)
+                .h(px(26.))
+                .px_2p5()
+                .gap_1p5()
+                .items_center()
+                .rounded(px(6.))
+                .text_size(px(12.5))
+                .font_weight(FontWeight::MEDIUM)
+                .cursor_pointer()
+                .when(primary, |e| {
+                    e.bg(theme.primary)
+                        .text_color(theme.primary_foreground)
+                        .hover(|s| s.bg(theme.primary_hover))
+                })
+                .when(!primary, |e| {
+                    e.border_1()
+                        .border_color(theme.border)
+                        .hover(|s| s.bg(theme.secondary_hover))
+                })
+                .when(primary, |e| {
+                    e.child(icon("furet/play.svg", theme.primary_foreground))
+                })
+                .child(label)
+        };
+        h_flex()
+            .h(px(44.))
             .px_3()
-            .gap_3()
+            .gap_2()
             .items_center()
             .border_b_1()
             .border_color(theme.border)
-            .child(
-                div()
-                    .font_weight(FontWeight::SEMIBOLD)
-                    .child(if current.is_empty() {
-                        "No connection".to_string()
-                    } else {
-                        current.clone()
-                    }),
-            )
-            .when(!stage.is_empty(), |e| {
+            .when_some(conn, |e, c| {
+                let (path, color) = kind_icon(&c.kind);
+                e.child(icon(path, color))
+                    .child(
+                        div()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .child(c.name.clone()),
+                    )
+                    .when(!c.stage.is_empty(), |e| {
+                        e.child(pill(c.stage.clone(), stage_color(&c.stage, cx)))
+                    })
+            })
+            .when(conn.is_none(), |e| {
+                e.child(
+                    div()
+                        .text_color(theme.muted_foreground)
+                        .child("Pick a connection on the left"),
+                )
+            })
+            .when_some(readonly, |e, ro| {
+                let (path, label, color) = if ro {
+                    ("furet/lock.svg", "read-only", theme.success)
+                } else {
+                    ("furet/lock-open.svg", "read-write", theme.danger)
+                };
+                e.child(
+                    h_flex()
+                        .id("furet-mode")
+                        .gap_1()
+                        .px_2()
+                        .h(px(22.))
+                        .items_center()
+                        .rounded(px(5.))
+                        .text_xs()
+                        .text_color(color)
+                        .border_1()
+                        .border_color(color.opacity(0.35))
+                        .cursor_pointer()
+                        .hover(|s| s.bg(color.opacity(0.08)))
+                        .on_click(cx.listener(|this, _, window, cx| this.toggle_mode(window, cx)))
+                        .child(icon(path, color).size(px(12.)))
+                        .child(label),
+                )
+            })
+            .when_some(self.confirm.clone(), |e, input| {
+                e.child(div().w(px(220.)).child(Input::new(&input).small()))
+            })
+            .child(div().flex_1())
+            .when(self.busy, |e| {
                 e.child(
                     div()
                         .text_xs()
-                        .text_color(stage_color(&stage, cx))
-                        .child(stage.clone()),
+                        .text_color(theme.muted_foreground)
+                        .child("running…"),
                 )
             })
-            .child(div().flex_1())
             .child(
-                div()
-                    .text_xs()
-                    .text_color(theme.muted_foreground)
-                    .child("⌘/Ctrl+Enter runs · ⇧ all · ⌘/Ctrl+click a key to follow · Esc back · Space inspector"),
-            );
+                button("furet-run-all", "Run all", false)
+                    .on_click(cx.listener(|this, _, window, cx| this.run(true, window, cx))),
+            )
+            .child(
+                button("furet-run", "Run", true)
+                    .on_click(cx.listener(|this, _, window, cx| this.run(false, window, cx))),
+            )
+    }
+
+    /// Rows and time, or what went wrong, above the results.
+    fn outcome_bar(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let theme = cx.theme().clone();
+        let plural = |n: u64| if n == 1 { "" } else { "s" };
+        let bar = || {
+            h_flex()
+                .h(px(30.))
+                .px_3()
+                .gap_3()
+                .items_center()
+                .text_xs()
+                .border_b_1()
+                .border_color(theme.border)
+        };
+        Some(match self.outcome.as_ref()? {
+            Outcome::Rows { rows, more, ms } => bar()
+                .child(div().font_weight(FontWeight::MEDIUM).child(format!(
+                    "{rows}{} row{}",
+                    if *more { "+" } else { "" },
+                    plural(*rows as u64)
+                )))
+                .child(
+                    div()
+                        .text_color(theme.muted_foreground)
+                        .child(format!("{ms} ms")),
+                )
+                .when(*more, |e| {
+                    e.child(
+                        div()
+                            .text_color(theme.muted_foreground)
+                            .child("first 1000 shown"),
+                    )
+                })
+                .into_any_element(),
+            Outcome::Affected { rows, ms } => bar()
+                .child(
+                    div()
+                        .font_weight(FontWeight::MEDIUM)
+                        .child(format!("{rows} row{} affected", plural(*rows))),
+                )
+                .child(
+                    div()
+                        .text_color(theme.muted_foreground)
+                        .child(format!("{ms} ms")),
+                )
+                .into_any_element(),
+            Outcome::Failed {
+                message,
+                detail,
+                ms,
+            } => v_flex()
+                .px_3()
+                .py_2()
+                .gap_1()
+                .bg(theme.danger.opacity(0.08))
+                .border_b_1()
+                .border_color(theme.danger.opacity(0.3))
+                .child(
+                    h_flex()
+                        .gap_2()
+                        .text_color(theme.danger)
+                        .font_weight(FontWeight::MEDIUM)
+                        .child(message.clone())
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(theme.muted_foreground)
+                                .child(format!("{ms} ms")),
+                        ),
+                )
+                .when_some(detail.clone(), |e, d| {
+                    e.child(div().text_xs().text_color(theme.muted_foreground).child(d))
+                })
+                .into_any_element(),
+        })
+    }
+}
+
+impl Render for Explorer {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = cx.theme().clone();
         let console = v_flex()
             .size_full()
             .key_context("FuretConsole")
@@ -1058,29 +1456,40 @@ impl Render for Explorer {
                 cx.listener(|this, _: &RunStatement, window, cx| this.run(false, window, cx)),
             )
             .on_action(cx.listener(|this, _: &RunAll, window, cx| this.run(true, window, cx)))
-            .child(toolbar)
+            .child(self.toolbar(cx))
             .child(
                 v_resizable("furet-split")
                     .child(
-                        resizable_panel()
-                            .size(px(220.))
-                            .child(Editor::new(&self.editor).h_full()),
+                        resizable_panel().size(px(200.)).child(
+                            div()
+                                .size_full()
+                                .pt_1()
+                                .child(Editor::new(&self.editor).appearance(false).h_full()),
+                        ),
                     )
-                    .child(resizable_panel().child(self.results_area(cx))),
+                    .child(
+                        resizable_panel().child(
+                            v_flex()
+                                .size_full()
+                                .border_t_1()
+                                .border_color(theme.border)
+                                .children(self.outcome_bar(cx))
+                                .child(div().flex_1().min_h_0().child(self.results_area(cx))),
+                        ),
+                    ),
             );
+        let keys = "⌘/Ctrl+↵ run · ⇧ all · ⌘/Ctrl+click follow · Esc back · Space inspector";
         let status = h_flex()
-            .h(px(26.))
+            .h(px(24.))
             .px_3()
             .gap_3()
             .items_center()
             .border_t_1()
             .border_color(theme.border)
-            .text_xs()
-            .child(
-                div()
-                    .text_color(theme.muted_foreground)
-                    .child(self.status.clone()),
-            )
+            .bg(theme.sidebar)
+            .text_size(px(11.5))
+            .text_color(theme.muted_foreground)
+            .child(div().flex_none().child(self.status.clone()))
             .when_some(self.error.clone(), |e, err| {
                 e.child(
                     div()
@@ -1089,16 +1498,19 @@ impl Render for Explorer {
                         .text_color(theme.danger)
                         .child(err),
                 )
-            });
+            })
+            .when(self.error.is_none(), |e| e.child(div().flex_1()))
+            .child(div().flex_none().child(keys));
         v_flex()
             .size_full()
             .bg(theme.background)
             .text_color(theme.foreground)
-            .text_sm()
+            .font_family(theme.font_family.clone())
+            .text_size(theme.font_size)
             .child(
                 div().flex_1().min_h_0().child(
                     h_resizable("furet-main")
-                        .child(resizable_panel().size(px(300.)).child(sidebar))
+                        .child(resizable_panel().size(px(290.)).child(self.sidebar(cx)))
                         .child(resizable_panel().child(console)),
                 ),
             )

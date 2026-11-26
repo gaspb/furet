@@ -134,4 +134,13 @@ impl Client {
             Some(json!({ "schema": schema, "table": table, "row": row })),
         )
     }
+
+    /// Read-only on or off; a prod connection wants its name typed to turn it off.
+    pub fn mode(&self, session: &str, write: bool, confirm: Option<&str>) -> Result<Value> {
+        self.engine.call(
+            "POST",
+            &format!("/sessions/{session}/mode?{}", q(&self.cwd)),
+            Some(json!({ "write": write, "confirm": confirm })),
+        )
+    }
 }
