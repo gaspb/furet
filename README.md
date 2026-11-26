@@ -185,10 +185,65 @@ to query on its own with `furet query`. Row values go along only from local, dev
 
 ## herdr
 
+![](docs/panel.png)
+
 `furet setup herdr` installs the Databases panel (in `panel/`, carried by the binary so it always matches the
-engine) and gives furet panes their name and icon. Open it from the command palette: **Databases**. It's a database
-explorer for the space's repo, on `furet serve`; the panel's own guide is in
-[herdr-mods](https://github.com/gaspb/herdr-mods#furet).
+engine) and gives furet panes their name and icon. It's a database explorer for the space's repo, on `furet serve`.
+Open it from the command palette (Ctrl+Shift+P, or Cmd+Shift+P: **Databases**) in the space whose repo you want, or
+from a key in `~/.config/herdr-app/keys.json`:
+
+```json
+{ "global": { "ctrl-alt-d": { "command": "tab.new", "args": { "mod": "furet", "name": "Databases" } } } }
+```
+
+- **Tree**: the repo's connections (stage colour, ⇄ tunnel), then schemas and tables. Click a connection to
+  connect, a table to open it. The filter narrows tables. A connected one says so; **⋯** (or right-click) →
+  **Disconnect** closes all its sessions (tree, tables, consoles), and its tunnel stops with them. Consoles then say
+  they're disconnected and reconnect on the next Run. Unused sessions also close after 30 idle minutes.
+- **Docker**: Postgres and ClickHouse containers that are running show up under **Running in Docker**, with nothing to
+  configure (this repo's compose services first, by service name); **Save…** keeps one as a configured connection.
+- **Connections**: **+** adds one (name, URL, password, stage, tunnel, note; for this repo or every repo), **Test**
+  connects first, through the tunnel. Passwords go to the OS keychain; the file only names them (or pick an env
+  var, a `.env` key or a command). **⋯** or right-click a connection to edit or remove it; **File** opens `furet edit`.
+- **Console** (`+ <connection> console`): Cmd/Ctrl+Enter runs the statement under the cursor (or the
+  selection), with Shift everything. Suggestions show while you type, or with Ctrl+Space: tables after FROM/JOIN,
+  otherwise the columns of the tables in the query (`alias.` narrows to one), then keywords. They match the start of a
+  word, a part of one (`amt` → `total_amount`) or letters in order; ↑↓ and PgUp/PgDn go through all of them, Tab or
+  Enter takes one. Line commands: Cmd/Ctrl+C or X with nothing selected copy or cut the line, Ctrl+D duplicates,
+  Alt+Shift+↑↓ moves, Ctrl+/ comments in or out. Errors put the cursor where Postgres says. Results page by
+  100/500/2000 rows; click a row to read it field by field (click a field to copy it); CSV and JSON copy
+  the page. **read-only** switches to read-write; on prod you type the connection's name first.
+  Each console has its own connection, and its text is kept per repo and connection.
+- **Grids**: click a cell to select it (arrows move, Ctrl/Cmd+C copies it), a header to sort (the whole table in
+  table views, the loaded rows in consoles); the selected row shows in the inspector. Values are coloured by
+  type; the line under each header gives the type, `pk`, and `→ table` for a foreign key.
+- **Browse rows**: see [Following rows](#following-rows-postgres) below.
+- **History and saved queries**: Ctrl+R in a console searches the repo's saved queries (`.furet/queries`, shared
+  through git) and what ran before (yours, and agents' through `furet query`, marked); Cmd/Ctrl+S saves the statement.
+- **Ask agent** (toolbar, error box, results, table views): your question goes to an agent in this space with the
+  connection, SQL, error and tables (row values only from local/dev/test), and the agent's pane comes up.
+- **Copy to…** (inspector, cell menu): the row and what it needs, to a local/dev/test connection, personal data
+  masked; a plan shows first. **Compare schema with…** (a connection's menu): the schema differences between two
+  connections and the SQL to align them.
+- **Right-click** anywhere: a connection (connect, console, edit…), a table (open, first rows in a console, copy its
+  name or a SELECT), a cell (copy the value, the row as JSON or CSV, the column; in table views, only rows with or
+  without this value, edit, set NULL, delete), a header (sort, copy), the editor (run, cut/copy/paste lines,
+  duplicate, comment), a tab (close the others).
+- **Keyboard**: ↑↓ in the tree, → to open or go in, ← to close or go up, Enter to open, Cmd/Ctrl+Enter for a console
+  (on a table, with its first rows), `/` to filter (↓ back to the tree), Shift+Enter for the menu (in results too).
+  Ctrl+` moves between tree, editor and results (Shift goes back), Esc goes from results back to the editor,
+  Ctrl+Shift+] and [ switch tabs. **?** in the tree (or F1) lists every key. All of it works on a laptop keyboard (no
+  F-keys, PgUp or Home needed; F6, Shift+F10 and Alt+PgUp/PgDn work too), and stays clear of herdr's own keys:
+  Alt+↑↓, Cmd+D, Cmd+/ and the tab keys keep working.
+- **Table**: data with WHERE and ORDER BY fields (Tab or → in an empty one takes the example, value selected)
+  and paging, and the structure (columns, indexes,
+  constraints, view definition). Tables with a primary key are editable: double-click a cell (or Enter) to change
+  it or set NULL, Del marks a row for deletion. Changes stay pending until **Submit**, which runs them as one
+  transaction: `UPDATE … WHERE <key> = … AND <column> IS NOT DISTINCT FROM <what was loaded>`, so a row someone
+  else changed in the meantime rolls everything back. **Preview SQL** shows the statements first. Read-only
+  connections need **Allow writes** (on prod, typing the name).
+
+The Postgres and ClickHouse icons are from [Simple Icons](https://simpleicons.org) (CC0).
 
 ### Following rows (Postgres)
 
