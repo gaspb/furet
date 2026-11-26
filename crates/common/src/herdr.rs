@@ -93,8 +93,6 @@ pub struct Mod<'a> {
     /// Who installs it, written in the marker so updates know the folder is theirs.
     pub owner: &'a str,
     pub files: &'a [(&'a str, &'a str)],
-    /// The folder and owner it had under an earlier name, replaced by this one.
-    pub formerly: Option<(&'a str, &'a str)>,
 }
 
 const MARKER: &str = ".installed-by";
@@ -126,40 +124,11 @@ impl Mod<'_> {
         app_dir().join("mods").join(self.name)
     }
 
-    /// The folder under its earlier name, if it's ours to remove: installed by that owner, by
-    /// herdr-mods' install.sh, or a link into a herdr-mods checkout.
-    fn former_dir(&self) -> Option<PathBuf> {
-        let (name, owner) = self.formerly?;
-        let dir = app_dir().join("mods").join(name);
-        let meta = fs::symlink_metadata(&dir).ok()?;
-        let ours = if meta.file_type().is_symlink() {
-            fs::read_link(&dir).is_ok_and(|to| to.ends_with(Path::new("mods").join(name)))
-        } else {
-            fs::read_to_string(dir.join(MARKER)).is_ok_and(|m| m.split(' ').next() == Some(owner))
-                || dir.join(HERDR_MODS_MARKER).exists()
-        };
-        ours.then_some(dir)
-    }
-
-    fn remove_former(&self) {
-        if let Some(dir) = self.former_dir() {
-            let removed = if fs::symlink_metadata(&dir).is_ok_and(|m| m.is_dir()) {
-                fs::remove_dir_all(&dir)
-            } else {
-                fs::remove_file(&dir)
-            };
-            if removed.is_ok() {
-                println!("removed {}", dir.display());
-            }
-        }
-    }
-
     /// Installs or refreshes the mod; herdr reloads it live.
     pub fn install(&self) -> Result<Installed> {
         if !app_dir().is_dir() {
             return Ok(Installed::NoHerdr);
         }
-        self.remove_former();
         let dir = self.dir();
         if fs::symlink_metadata(&dir).is_ok_and(|m| m.file_type().is_symlink()) {
             let to = fs::read_link(&dir).unwrap_or_default();
@@ -207,8 +176,7 @@ impl Mod<'_> {
     /// Refreshes the mod only where this tool installed it before (after an update).
     pub fn refresh(&self) -> Result<Installed> {
         let marker = fs::read_to_string(self.dir().join(MARKER)).ok();
-        let ours = marker.is_some_and(|m| m.split(' ').next() == Some(self.owner));
-        if !ours && self.former_dir().is_none() {
+        if !marker.is_some_and(|m| m.split(' ').next() == Some(self.owner)) {
             return Ok(Installed::Unchanged);
         }
         self.install()

@@ -38,9 +38,6 @@ Secret Service (GNOME Keyring, KWallet, KeePassXC). For the herdr panel, see [he
 macOS and Linux (Intel and ARM). `furet update` updates it later. From source:
 `cargo install --locked --git https://github.com/gaspb/furet furet`.
 
-furet was called dbx: on first run it takes over dbx's connections, history, keychain passwords
-and herdr panel.
-
 ## Commands
 
 ```

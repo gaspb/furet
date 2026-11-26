@@ -9,6 +9,8 @@ use std::path::{Path, PathBuf};
 use toml_edit::{DocumentMut, InlineTable, Item, Table, value};
 
 const KEYCHAIN_SERVICE: &str = "furet";
+/// Where furet kept passwords when it was called dbx.
+const DBX_SERVICE: &str = "dbx";
 
 pub const PROJECT_TEMPLATE: &str = r#"# furet connections for {root}
 # Kept outside the repo; its worktrees share them. Values can be read when needed:
@@ -127,8 +129,8 @@ pub fn keychain_get(account: &str) -> Result<String> {
     if let Ok(p) = e.get_password() {
         return Ok(p);
     }
-    let old = keyring::Entry::new(crate::migrate::OLD, account)
-        .and_then(|o| o.get_password().map(|p| (o, p)));
+    let old =
+        keyring::Entry::new(DBX_SERVICE, account).and_then(|o| o.get_password().map(|p| (o, p)));
     if let Ok((o, p)) = old
         && e.set_password(&p).is_ok()
     {
@@ -145,7 +147,7 @@ pub fn keychain_set(account: &str, password: &str) -> Result<()> {
 }
 
 pub fn keychain_delete(account: &str) {
-    for service in [KEYCHAIN_SERVICE, crate::migrate::OLD] {
+    for service in [KEYCHAIN_SERVICE, DBX_SERVICE] {
         if let Ok(e) = keyring::Entry::new(service, account) {
             let _ = e.delete_credential();
         }

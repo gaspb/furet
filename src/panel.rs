@@ -9,7 +9,6 @@ macro_rules! files {
 pub const PANEL: Mod = Mod {
     name: "furet",
     owner: "furet",
-    formerly: Some(("dbx", "dbx")),
     files: files!(
         "mod.json",
         "main.js",

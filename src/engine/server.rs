@@ -9,7 +9,7 @@ use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::os::unix::process::CommandExt;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -56,10 +56,6 @@ fn info_file() -> PathBuf {
     dir().join("serve.json")
 }
 
-fn info_in(d: &Path) -> Option<Info> {
-    serde_json::from_str(&fs::read_to_string(d.join("serve.json")).ok()?).ok()
-}
-
 pub fn random_hex(bytes: usize) -> String {
     let mut buf = vec![0u8; bytes];
     fs::File::open("/dev/urandom")
@@ -90,7 +86,7 @@ fn write_info(info: &Info) -> Result<()> {
 }
 
 fn read_info() -> Option<Info> {
-    info_in(&dir())
+    serde_json::from_str(&fs::read_to_string(info_file()).ok()?).ok()
 }
 
 /// A tiny HTTP client for talking to a running server.
@@ -133,15 +129,11 @@ fn current(info: &Info) -> bool {
 /// Stops the running engine and waits until it has let go of its lock (closing its sessions and
 /// tunnels), so another can start right after.
 pub fn stop() -> bool {
-    stop_in(&dir())
-}
-
-pub fn stop_in(d: &Path) -> bool {
-    let asked = info_in(d).is_some_and(|info| {
+    let asked = read_info().is_some_and(|info| {
         call(&info, "POST", "/shutdown").is_some_and(|(status, _)| status == 200)
     });
     let deadline = std::time::Instant::now() + Duration::from_secs(15);
-    while asked && running_in(d) && std::time::Instant::now() < deadline {
+    while asked && engine_running() && std::time::Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(50));
     }
     asked
@@ -150,13 +142,9 @@ pub fn stop_in(d: &Path) -> bool {
 /// Whether a furet engine holds the lock: only your processes can open it (0700 folder), so a
 /// `serve.json` without a holder is stale, whatever answers on its port.
 fn engine_running() -> bool {
-    running_in(&dir())
-}
-
-fn running_in(d: &Path) -> bool {
     let Ok(lock) = fs::OpenOptions::new()
         .write(true)
-        .open(d.join("serve.lock"))
+        .open(dir().join("serve.lock"))
     else {
         return false;
     };
