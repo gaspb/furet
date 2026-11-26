@@ -1,7 +1,7 @@
 // A database explorer for the space's repo, on `furet serve`: connections → schemas → tables on the
 // left, consoles and table views on the right. Open it as a tab: tab.new {mod: "furet", name: "Databases"}.
 import { View, div, svg } from "gpui-kit";
-import { v_flex, h_flex, InputState, Input, Editor, EditorState, Scrollbar, ScrollHandle, VirtualListScrollHandle, v_virtual_list, h_resizable, v_resizable, resizable_panel } from "gpui-base";
+import { v_flex, h_flex, InputState, Input, Editor, EditorState, Scrollbar, ScrollHandle, VirtualListScrollHandle, v_virtual_list, h_resizable, v_resizable, resizable_panel, TextView } from "gpui-base";
 import { spaces, focused, theme, settings, props, nextCommand, run } from "herdr";
 import { platform } from "process";
 import { call, missing, INSTALL } from "./api.js";
@@ -36,6 +36,12 @@ function stageColor(t, stage) {
 const compact = (n) => (n >= 1e6 ? `${(n / 1e6).toFixed(1)}M` : n >= 1e3 ? `${(n / 1e3).toFixed(1)}k` : String(n));
 const RELKINDS = { v: "view", m: "materialized view" };
 const bytes = (n) => (n >= 1 << 30 ? `${(n / (1 << 30)).toFixed(1)} GB` : n >= 1 << 20 ? `${(n / (1 << 20)).toFixed(1)} MB` : `${Math.ceil(n / 1024)} kB`);
+
+/** Text that can be selected and copied (TextView draws it in the theme's text colour). */
+function copyableText(id, text) {
+  const html = String(text).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/\n/g, "<br>");
+  return TextView.html(id, html).selectable(true);
+}
 
 export default class Furet extends View {
   init(_props, cx) {
@@ -611,6 +617,7 @@ export default class Furet extends View {
 
   clickTree(key, cx) {
     const [type, name, schema, table] = key.split("\u0001");
+    if (type === "e") { this.copy(this.source(name).error ?? "", "the error", cx); return; }
     if (["c", "s", "t"].includes(type)) { this.treeSel = key; this.zone = "tree"; this.treeHandle.focus(); }
     if (type === "c") this.toggleConnection(name, cx);
     else if (type === "s") {
@@ -661,7 +668,8 @@ export default class Furet extends View {
         .child(div().flex_1().min_w(0).truncate().child(r.x.name))
         .child(div().text_size(11).text_color(t.dim).child(r.x.kind === "table" ? compact(r.x.rows) : ""));
     }
-    return base.child(div().flex_1().min_w(0).truncate().text_size(11).text_color(r.type === "error" ? t.ansi1 : t.dim).child(r.text));
+    return base.child(div().flex_1().min_w(0).truncate().text_size(11).text_color(r.type === "error" ? t.ansi1 : t.dim).child(r.text))
+      .when(r.type === "error", (e) => e.cursor_pointer().tooltip(`${r.text}\n\nClick to copy`));
   }
 
   /** The keyboard's row in the tree: outlined, filled while the tree has the keyboard. */
@@ -974,7 +982,7 @@ export default class Furet extends View {
         .child(Input.new(this.filterInput).flex_1().h_full().text_size(12).text_color(t.foreground)))
       .when(Boolean(this.conns?.update) && this.dismissedUpdate !== this.conns?.update, (e) => e.child(this.updateBar(t)))
       .when(Boolean(this.menu), (e) => e.child(this.menuBar(t)))
-      .when(!rows.length, (e) => e.child(v_flex().p(12).gap(10).text_size(12).text_color(this.error ? t.ansi1 : t.dim).child(empty)
+      .when(!rows.length, (e) => e.child(v_flex().p(12).gap(10).text_size(12).text_color(this.error ? t.ansi1 : t.dim).child(copyableText("furet-empty", empty))
         .when(Boolean(this.conns) && !this.error, (e) => e.child(h_flex().child(this.button("furet-first-add", "+ Add a connection", (cx) => openForm(this, null, cx), { t, primary: true }))))))
       .when(rows.length > 0, (e) => e.child(div().id("furet-tree-wrap").flex_1().min_h(0).relative().px(4).text_size(12.5)
         .track_focus(this.treeHandle).on_key_down((e, cx) => this.treeKey(e, cx))
@@ -1019,13 +1027,18 @@ export default class Furet extends View {
 
   errorBox(err, text, t, tab) {
     const where = err.position !== undefined && err.position !== null && text ? lineCol(text, err.position) : null;
+    const head = err.message + (where ? `  (line ${where.line}, column ${where.col})` : "");
+    const all = [head, err.detail, err.hint && `Hint: ${err.hint}`].filter(Boolean).join("\n");
+    const id = `furet-err-${tab?.id ?? "x"}`;
     return v_flex().m(8).p(10).gap(4).rounded(8).border_1().border_color(tint(t.ansi1, "88")).bg(tint(t.ansi1, "14")).text_size(12)
-      .child(div().text_color(t.ansi1).font_semibold().child(err.message + (where ? `  (line ${where.line}, column ${where.col})` : "")))
-      .when(Boolean(err.detail), (e) => e.child(div().text_color(t.foreground).child(err.detail)))
-      .when(Boolean(err.hint), (e) => e.child(div().text_color(t.muted).child(`Hint: ${err.hint}`)))
+      .child(copyableText(`${id}-m`, head))
+      .when(Boolean(err.detail), (e) => e.child(copyableText(`${id}-d`, err.detail)))
+      .when(Boolean(err.hint), (e) => e.child(copyableText(`${id}-h`, `Hint: ${err.hint}`)))
       .when(Boolean(err.closed), (e) => e.child(div().text_color(t.muted).child("The connection was lost; the next run reconnects.")))
-      .when(Boolean(tab), (e) => e.child(h_flex().pt(4).child(this.button(`furet-ask-error-${tab.id}`, "Ask an agent to fix it",
-        (cx) => openAsk(this, tab, "error", cx), { t }))));
+      .child(h_flex().pt(4).gap(6)
+        .child(this.button(`${id}-copy`, "Copy", (cx) => this.copy(all, "the error", cx), { t }))
+        .when(Boolean(tab), (e) => e.child(this.button(`furet-ask-error-${tab.id}`, "Ask an agent to fix it",
+          (cx) => openAsk(this, tab, "error", cx), { t }))));
   }
 
   results(tab, t, text) {
