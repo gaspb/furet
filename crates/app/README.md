@@ -19,8 +19,15 @@ panel, so connections, tunnels, read-only rules and the history are the same eve
 - Results in a virtualized table: values coloured by type, null in italics, foreign keys underlined, each column's
   type (and what a foreign key points at) under its name.
 
-An early version: the herdr panel has more (row browsing by foreign keys, the inspector, history, Ask agent, copying
-rows, schema drift). They come over here next, on the same engine routes.
+- Following rows, as in the panel:
+  - Hovering a foreign-key value shows the row it points at in a few words.
+  - Cmd/Ctrl+click it, double-click it, or Cmd/Ctrl+Enter on it, opens that row.
+  - A trail above the results leads back (Esc goes back one step), and **As SQL** puts the step in the editor.
+  - Columns without a constraint are matched by name (`→ tenants?`).
+- The inspector beside the results (Space) shows the selected row, where its keys point, and what points at it, with
+  counts. Click any of them to go there.
+
+Not here yet, compared with the herdr panel: history, Ask agent, copying rows and schema drift.
 
 Not in the release yet (it's a heavy build): `cargo build -p furet-app`, or the install line above. Linux needs the usual
 GPUI libraries (X11 or Wayland, Vulkan, fontconfig).
