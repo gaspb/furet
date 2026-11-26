@@ -1,8 +1,24 @@
 # furet
 
-Database connections tied to the repo you're in, stored outside it. Secrets are read when a
-connection opens (env, `.env`, any command), port-forwards start and stop on their own, and
-anything that isn't local opens read-only.
+![furet in herdr: a read-only staging console, its results, and suggestions for orgs' columns](docs/hero.png)
+
+A database explorer for the repo you're in, for Postgres and ClickHouse: in [herdr](https://herdr.dev), in its own
+window, or in the terminal, and just as usable by your coding agents.
+
+- **Light.** One 14 MB binary, no runtime. The engine behind the explorers uses about 8 MB of memory and stops when
+  it's idle.
+- **In herdr or on its own.** A Databases panel in herdr, [furet-app](crates/app) as a native window (GPUI), or the
+  terminal: `furet stg` opens `psql` on staging, `furet query` prints a table, CSV or JSON.
+- **Postgres and ClickHouse**, with the same tree, consoles and history.
+- **Connections per repo.** Stored outside the repo and shared by its worktrees. Secrets are references (OS keychain,
+  env, `.env`, any command), never in the file.
+- **Tunnels on their own.** A connection's `kubectl port-forward` (or any command) starts when it opens and stops when
+  you're done.
+- **Docker, found.** Running Postgres and ClickHouse containers show up with their credentials, nothing to configure.
+- **Safe by default.** Anything that isn't local opens read-only; on prod, writes need you to type its name.
+- **Rows you can follow.** A foreign key, declared or guessed from its name, leads to the row it points at, and the
+  inspector to the rows pointing back.
+- **Agents included.** `furet query` gives agents the same connections and rules, and the history shows who ran what.
 
 ## Quick start
 
@@ -21,8 +37,6 @@ Secret Service (GNOME Keyring, KWallet, KeePassXC). For the herdr panel, see [he
 
 macOS and Linux (Intel and ARM). `furet update` updates it later. From source:
 `cargo install --locked --git https://github.com/gaspb/furet furet`.
-
-There's also [furet-app](crates/app), the same explorer as a native window, on the same engine.
 
 furet was called dbx: on first run it takes over dbx's connections, history, keychain passwords
 and herdr panel.

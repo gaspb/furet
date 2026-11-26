@@ -1,5 +1,7 @@
 # furet-app
 
+![furet-app on a read-only staging connection, with the inspector open on an invoice](../../docs/app.png)
+
 furet's database explorer as its own native window, for when you're not in herdr. Built on
 [GPUI](https://gpui.rs) (Zed's GPU UI framework) with [gpui-kit](https://gpui-kit.com): no webview, no
 JavaScript runtime.
