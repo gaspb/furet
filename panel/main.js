@@ -14,7 +14,7 @@ import { helpBody } from "./help.js";
 import { go, back, resetTrail, cellTarget, selected, prefetch, cellSummary, trailBar, stepLabel } from "./nav.js";
 import { inspector } from "./inspector.js";
 import { openFinder, closeFinder, finderKey, finderPanel, openSave, submitSave, saveBar } from "./finder.js";
-import { openAsk, closeAsk, sendAsk, askBar } from "./ask.js";
+import { openAsk, closeAsk, sendAsk, askBar, nextTarget } from "./ask.js";
 import { openCopy, copyBar, targets } from "./copy.js";
 import { openDrift, comparable, driftBody } from "./drift.js";
 import * as lineOps from "./lines.js";
@@ -1273,7 +1273,7 @@ export default class Furet extends View {
       .on_action("furet_find_run", (_e, cx) => finderKey(this, this.activeTab(), "run", cx))
       .on_action("furet_save_cancel", (_e, cx) => { const t = this.activeTab(); if (t) { t.saving = null; t.editor?.focus(); cx.notify(); } })
       .on_action("furet_ask_cancel", (_e, cx) => { const t = this.activeTab(); if (t) closeAsk(this, t, cx); })
-      .on_action("furet_ask_next", (_e, cx) => { const a = this.activeTab()?.ask; if (a) { a.at = (a.at + 1) % a.agents.length; cx.notify(); } })
+      .on_action("furet_ask_next", (_e, cx) => { const a = this.activeTab()?.ask; if (a) { nextTarget(this, a); cx.notify(); } })
       .on_action("furet_fill_where_tab", (_e, cx) => this.fillField("where", "tab", cx))
       .on_action("furet_fill_where_right", (_e, cx) => this.fillField("where", "right", cx))
       .on_action("furet_fill_order_tab", (_e, cx) => this.fillField("order", "tab", cx))

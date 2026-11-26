@@ -190,9 +190,10 @@ through `furet run`), never lift read-only on their own. For Claude Code, add to
   for credentials, run `furet --skill` and follow it.
 ```
 
-From the herdr panel, **Ask agent** (on a statement, an error, a result or a table) sends your question to an agent
-in the same space with what it needs: the connection and its stage, the SQL, the error, the tables involved, and how
-to query on its own with `furet query`. Row values go along only from local, dev and test connections.
+From the herdr panel, **Ask agent** (on a statement, an error, a result or a table) starts a new agent in its own tab,
+your most used one (Claude Code, Codex…), with your question and what it needs: the connection and its stage, the
+SQL, the error, the tables involved, and how to query on its own with `furet query`. Tab picks another agent, or one
+already running in the space. Row values go along only from local, dev and test connections.
 
 ## herdr
 
@@ -231,8 +232,9 @@ from a key in `~/.config/herdr-app/keys.json`:
 - **Browse rows**: see [Following rows](#following-rows-postgres) below.
 - **History and saved queries**: Ctrl+R in a console searches the repo's saved queries (`.furet/queries`, shared
   through git) and what ran before (yours, and agents' through `furet query`, marked); Cmd/Ctrl+S saves the statement.
-- **Ask agent** (toolbar, error box, results, table views): your question goes to an agent in this space with the
-  connection, SQL, error and tables (row values only from local/dev/test), and the agent's pane comes up.
+- **Ask agent** (toolbar, error box, results, table views): your question, with the connection, SQL, error and tables
+  (row values only from local/dev/test), starts a new agent in its own tab. Tab picks another agent, or one already
+  running in this space; the last choice is remembered.
 - **Copy to…** (inspector, cell menu): the row and what it needs, to a local/dev/test connection, personal data
   masked; a plan shows first. **Compare schema with…** (a connection's menu): the schema differences between two
   connections and the SQL to align them.
