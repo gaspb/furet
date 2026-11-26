@@ -1,0 +1,8 @@
+{
+  "place": "none",
+  "title": "Databases",
+  "focusable": true,
+  "palette": [
+    { "title": "Databases", "command": "tab.new", "args": { "mod": "furet", "name": "Databases" }, "words": "furet database sql postgres clickhouse query tables" }
+  ]
+}

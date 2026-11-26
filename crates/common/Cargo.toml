@@ -1,7 +1,7 @@
 [package]
 name = "common"
 version = "0.1.0"
-description = "Shared bits of the tui-tools: repo scoping, data dirs, herdr setup"
+description = "Shared bits of furet: repo scoping, data dirs, herdr setup"
 publish = false
 edition.workspace = true
 license.workspace = true
