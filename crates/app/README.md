@@ -12,7 +12,13 @@ furet-app ~/src/my-api      # the repo whose connections to show (default: the c
 It needs `furet` on the PATH (or `FURET_BIN`): it talks to the same `furet serve` engine as the CLI and the herdr
 panel, so connections, tunnels, read-only rules and the history are the same everywhere.
 
-- The tree: connections (with their stage), then schemas and tables. Opening a connection connects.
+- It looks like the herdr panel: herdr's "paper" and "graphite" palettes (following the system's light or dark mode),
+  Geist and JetBrains Mono, which the app carries.
+- The tree: connections (Postgres or ClickHouse, endpoint, stage), then schemas and tables with their size. Opening a
+  connection connects.
+- The toolbar: the connection, its stage, and **read-only** or **read-write**. Click that to switch; on prod you type
+  the connection's name first. **Run** and **Run all**.
+- Above the results: rows and time, or the error with its detail and hint.
 - A table in the tree shows its first 200 rows.
 - The SQL editor (tree-sitter highlighting): Cmd/Ctrl+Enter runs the statement under the cursor, Cmd/Ctrl+Shift+Enter
   everything.

@@ -40,6 +40,9 @@ pub struct Set {
 
 pub type Follow = Rc<dyn Fn(usize, usize, &mut Window, &mut App)>;
 
+/// The row-number column before the data: table column `NUMBERS + i` is the set's column `i`.
+pub const NUMBERS: usize = 1;
+
 #[derive(Default)]
 pub struct Results {
     pub set: Set,
@@ -102,7 +105,7 @@ pub fn arrow(r: &Ref) -> String {
 
 impl TableDelegate for Results {
     fn columns_count(&self, _: &App) -> usize {
-        self.set.columns.len()
+        self.set.columns.len() + NUMBERS
     }
 
     fn rows_count(&self, _: &App) -> usize {
@@ -110,6 +113,14 @@ impl TableDelegate for Results {
     }
 
     fn column(&self, ix: usize, _: &App) -> Column {
+        if ix < NUMBERS {
+            let digits = self.set.rows.len().max(1).to_string().len().max(2);
+            return Column::new("n", "")
+                .width(px(digits as f32 * 7.5 + 18.))
+                .resizable(false)
+                .text_right();
+        }
+        let ix = ix - NUMBERS;
         let c = &self.set.columns[ix];
         let longest = self
             .set
@@ -138,26 +149,33 @@ impl TableDelegate for Results {
         _: &mut Window,
         cx: &mut Context<TableState<Self>>,
     ) -> impl IntoElement {
-        let c = &self.set.columns[ix];
+        if ix < NUMBERS {
+            return div().into_any_element();
+        }
+        let c = &self.set.columns[ix - NUMBERS];
         let under = [c.ty.clone(), c.refs.as_ref().map(arrow)]
             .into_iter()
             .flatten()
             .collect::<Vec<_>>()
             .join(" · ");
+        let theme = cx.theme();
         div()
             .flex()
             .flex_col()
+            .font_family(theme.mono_font_family.clone())
             .child(
                 div()
                     .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(theme.foreground)
                     .child(c.name.clone()),
             )
             .child(
                 div()
-                    .text_xs()
-                    .text_color(cx.theme().muted_foreground)
+                    .text_size(px(10.5))
+                    .text_color(theme.muted_foreground)
                     .child(under),
             )
+            .into_any_element()
     }
 
     fn render_td(
@@ -168,6 +186,15 @@ impl TableDelegate for Results {
         cx: &mut Context<TableState<Self>>,
     ) -> impl IntoElement {
         let theme = cx.theme();
+        if ix < NUMBERS {
+            return div()
+                .font_family(theme.mono_font_family.clone())
+                .text_size(px(11.))
+                .text_color(theme.muted_foreground)
+                .child((row + 1).to_string())
+                .into_any_element();
+        }
+        let ix = ix - NUMBERS;
         let c = &self.set.columns[ix];
         let v = self.set.rows[row][ix].clone();
         let k = c.ty.as_deref().map_or(Kind::Text, kind);
@@ -198,6 +225,7 @@ impl TableDelegate for Results {
             .id(("cell", row * 4096 + ix))
             .truncate()
             .font_family(theme.mono_font_family.clone())
+            .text_size(theme.mono_font_size)
             .text_color(color)
             .when(v.is_none(), |e| e.italic())
             .when(link, |e| e.underline())
@@ -213,10 +241,14 @@ impl TableDelegate for Results {
                 })
             })
             .child(one_line)
+            .into_any_element()
     }
 
     fn cell_text(&self, row: usize, ix: usize, _: &App) -> String {
-        self.set.rows[row][ix].clone().unwrap_or_default()
+        match ix.checked_sub(NUMBERS) {
+            Some(ix) => self.set.rows[row][ix].clone().unwrap_or_default(),
+            None => (row + 1).to_string(),
+        }
     }
 }
 

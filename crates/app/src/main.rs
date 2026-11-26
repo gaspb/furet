@@ -2,8 +2,10 @@
 //! `folder` (default: here). It talks to the same `furet serve` as the CLI and the herdr panel, so
 //! connections, tunnels, read-only rules and the history are the same.
 
+mod assets;
 mod engine;
 mod explorer;
+mod look;
 mod results;
 
 use gpui_kit::*;
@@ -24,8 +26,9 @@ fn main() {
             .file_name()
             .map_or(cwd.clone(), |n| n.to_string_lossy().into_owned())
     );
-    application().run(move |cx| {
+    application().with_assets(assets::Assets).run(move |cx| {
         gpui_kit::init(cx);
+        assets::load_fonts(cx);
         explorer::bind_keys(cx);
         let options = WindowOptions {
             window_bounds: Some(WindowBounds::Windowed(Bounds::centered(
@@ -40,6 +43,7 @@ fn main() {
             ..Default::default()
         };
         open_window(options, cx, |window, cx| {
+            look::follow_system(window, cx);
             cx.new(|cx| explorer::Explorer::new(cwd, window, cx))
         })
         .expect("cannot open the window");
