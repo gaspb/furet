@@ -276,7 +276,20 @@ jobs:
           # Write and read notes from a file to avoid quoting breaking things
           echo "$ANNOUNCEMENT_BODY" > $RUNNER_TEMP/notes.txt
 
-          gh release create "${{ needs.plan.outputs.tag }}" --target "$RELEASE_COMMIT" $PRERELEASE_FLAG --title "$ANNOUNCEMENT_TITLE" --notes-file "$RUNNER_TEMP/notes.txt" artifacts/*
+          TAG="${{ needs.plan.outputs.tag }}"
+          # A release made on GitHub (which is how its UI creates a tag) gets the files and keeps its
+          # title and notes, with the install notes added below them.
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release view "$TAG" --json body -q .body > $RUNNER_TEMP/theirs.txt
+            if [ -s $RUNNER_TEMP/theirs.txt ]; then
+              { cat $RUNNER_TEMP/theirs.txt; echo; echo; cat $RUNNER_TEMP/notes.txt; } > $RUNNER_TEMP/both.txt
+              mv $RUNNER_TEMP/both.txt $RUNNER_TEMP/notes.txt
+            fi
+            gh release upload "$TAG" artifacts/* --clobber
+            gh release edit "$TAG" --notes-file "$RUNNER_TEMP/notes.txt"
+          else
+            gh release create "$TAG" --target "$RELEASE_COMMIT" $PRERELEASE_FLAG --title "$ANNOUNCEMENT_TITLE" --notes-file "$RUNNER_TEMP/notes.txt" artifacts/*
+          fi
 
   announce:
     needs:

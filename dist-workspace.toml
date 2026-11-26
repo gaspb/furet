@@ -17,3 +17,5 @@ install-path = "~/.local/bin"
 hosting = "github"
 # Installs `furet-update` next to furet: `furet update` runs it
 install-updater = true
+# The release workflow also fills a release made on GitHub (see its "Create GitHub Release" step)
+allow-dirty = ["ci"]

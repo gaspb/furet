@@ -1,4 +1,6 @@
 # `cargo release patch|minor|major -p furet --execute`: bumps furet's version, commits, tags vX.Y.Z
 # and pushes. The tag triggers .github/workflows/release.yml (binaries, installer, GitHub Release).
+# A release made on GitHub with a new vX.Y.Z tag works too, once Cargo.toml has that version: the
+# workflow adds the files to it.
 publish = false
 tag-name = "v{{version}}"
