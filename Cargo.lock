@@ -1469,40 +1469,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "dbx"
-version = "0.2.0"
-dependencies = [
- "anyhow",
- "clap",
- "common",
- "keyring",
- "libc",
- "postgres",
- "ratatui",
- "rustls",
- "serde",
- "serde_json",
- "tiny_http",
- "tokio-postgres-rustls",
- "toml 1.2.2+spec-1.1.0",
- "toml_edit 0.25.20+spec-1.1.0",
- "ureq",
- "url",
- "webpki-roots",
-]
-
-[[package]]
-name = "dbx-app"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "gpui-kit",
- "serde",
- "serde_json",
- "ureq",
-]
-
-[[package]]
 name = "deltae"
 version = "0.3.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2105,6 +2071,40 @@ dependencies = [
  "cc",
  "libc",
  "pkg-config",
+]
+
+[[package]]
+name = "furet"
+version = "0.2.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "common",
+ "keyring",
+ "libc",
+ "postgres",
+ "ratatui",
+ "rustls",
+ "serde",
+ "serde_json",
+ "tiny_http",
+ "tokio-postgres-rustls",
+ "toml 1.2.2+spec-1.1.0",
+ "toml_edit 0.25.20+spec-1.1.0",
+ "ureq",
+ "url",
+ "webpki-roots",
+]
+
+[[package]]
+name = "furet-app"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "gpui-kit",
+ "serde",
+ "serde_json",
+ "ureq",
 ]
 
 [[package]]

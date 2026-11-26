@@ -1,8 +1,0 @@
-{
-  "place": "none",
-  "title": "Databases",
-  "focusable": true,
-  "palette": [
-    { "title": "Databases", "command": "tab.new", "args": { "mod": "dbx", "name": "Databases" }, "words": "dbx database sql postgres clickhouse query tables" }
-  ]
-}

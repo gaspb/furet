@@ -1,4 +1,4 @@
-# `cargo release patch|minor|major -p dbx --execute`: bumps dbx's version, commits, tags dbx-vX.Y.Z
+# `cargo release patch|minor|major -p furet --execute`: bumps furet's version, commits, tags vX.Y.Z
 # and pushes. The tag triggers .github/workflows/release.yml (binaries, installer, GitHub Release).
 publish = false
-tag-name = "{{crate_name}}-v{{version}}"
+tag-name = "v{{version}}"
