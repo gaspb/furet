@@ -20,7 +20,8 @@ export const stepSql = (s) =>
   `select * from ${quoteIdent(s.schema)}.${quoteIdent(s.table)} where ${quoteIdent(s.column)} = ${literal(s.value)}`;
 
 /** "customers #8" for a row found by its id, "orders · customer_id = 8" for rows found by a column. */
-export const stepLabel = (s) => (s.column === "id" ? `${s.table} #${s.value}` : `${s.table} · ${s.column} = ${s.value}`);
+const short = (v) => (/^[0-9a-f]{8}-[0-9a-f]{4}-/i.test(v) ? `${v.slice(0, 8)}…` : v);
+export const stepLabel = (s) => (s.column === "id" ? `${s.table} #${short(s.value)}` : `${s.table} · ${s.column} = ${short(s.value)}`);
 
 /** Shows the rows of `target.table` whose `target.column` is `target.value`: one step on. */
 export function go(view, tab, target, cx) {

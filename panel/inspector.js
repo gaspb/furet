@@ -36,7 +36,7 @@ export function inspector(view, tab, t, font) {
       .child(div().font_family(font.font_family).text_size(font.font_size - 1)
         .text_color(v === null ? t.dim : c.refs ? t.accent : colors[kind] ?? t.foreground).when(v === null, (e) => e.italic())
         .child(v === null ? "null" : pretty(kind, v).slice(0, 6000)))
-      .when(Boolean(c.refs) && v !== null, (e) => e.child(link(`furet-insp-go-${i}`, `→ ${c.refs.table}${about ? ` · ${about}` : ""}`,
+      .when(Boolean(c.refs) && v !== null, (e) => e.child(link(`furet-insp-go-${i}`, `→ ${c.refs.table}${about ? ` · ${about}` : ""}${c.refs.guessed ? " · guessed from the name" : ""}`,
         (cx) => go(view, tab, { ...c.refs, value: v }, cx))));
   });
 
@@ -48,7 +48,7 @@ export function inspector(view, tab, t, font) {
         : referrers.map((x, i) => h_flex().id(`furet-insp-ref-${i}`).px(12).py(3).gap(8).items_center().rounded(4)
           .when(x.count > 0, (e) => e.cursor_pointer().hover((s) => s.bg(t.hover))
             .on_click((_e, cx) => go(view, tab, { schema: x.schema, table: x.table, column: x.column, value: x.value, reverse: true }, cx)))
-          .child(div().flex_1().min_w(0).truncate().text_size(12).text_color(x.count ? t.foreground : t.dim).child(`${x.table}.${x.column}`))
+          .child(div().flex_1().min_w(0).truncate().text_size(12).text_color(x.count ? t.foreground : t.dim).child(`${x.table}.${x.column}${x.guessed ? " (by name)" : ""}`))
           .child(div().text_size(11.5).text_color(x.count ? t.accent : t.dim)
             .child(x.count ? `${x.count}${x.more ? "+" : ""} row${x.count === 1 ? "" : "s"} →` : "none")));
 

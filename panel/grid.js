@@ -111,7 +111,7 @@ export function grid(id, set, opts) {
         .child(div().truncate().font_semibold().text_color(sort?.col === i ? t.accent : t.foreground)
           .child(c.name + arrow))
         .when(Boolean(c.type), (e) => e.child(div().truncate().text_size(Math.max(9, size - 3)).text_color(t.dim)
-          .child([c.type, keyCols.has(c.name) && "pk", c.refs && `→ ${c.refs.table}`].filter(Boolean).join(" · "))));
+          .child([c.type, keyCols.has(c.name) && "pk", c.refs && `→ ${c.refs.table}${c.refs.guessed ? "?" : ""}`].filter(Boolean).join(" · "))));
     }));
   const row = (k) => {
     const i = order[k], r = set.rows[i], onRow = sel?.row === i, gone = deleted?.has(i);

@@ -861,7 +861,7 @@ export default class Furet extends View {
       fk && v !== null && { label: `Go to ${stepLabel({ ...fk, value: v })}`, hint: "⌘↵", run: (cx) => go(this, tab, { ...fk, value: v }, cx) },
       fk && v !== null && { label: `Open ${fk.table} at this row`, run: (cx) => this.openTable(tab.conn, fk.schema, fk.table, "table", cx, `${quoteIdent(fk.column)} = ${literal(v)}`) },
       ...(Array.isArray(referrers) ? referrers.filter((x) => x.count).map((x) => ({
-        label: `${x.table}.${x.column} · ${x.count}${x.more ? "+" : ""} row${x.count === 1 ? "" : "s"}`, hint: "r",
+        label: `${x.table}.${x.column}${x.guessed ? " (by name)" : ""} · ${x.count}${x.more ? "+" : ""} row${x.count === 1 ? "" : "s"}`, hint: "r",
         run: (cx) => go(this, tab, { ...x, reverse: true }, cx) })) : []),
       (fk && v !== null) || (Array.isArray(referrers) && referrers.some((x) => x.count)) ? "-" : null,
       { label: "Copy value", hint: "⌘C", run: (cx) => this.copy(v ?? "", "the value", cx) },
@@ -1096,7 +1096,7 @@ export default class Furet extends View {
     const o = this.origin ?? { x: 0, y: 0, width: 800, height: 600 };
     const at = { position: { x: o.x + o.width / 2, y: o.y + o.height / 3 } };
     if (!Array.isArray(list)) { this.flash(list === null ? "Still looking…" : "Select a row first", cx); return; }
-    const items = list.filter((x) => x.count).map((x) => ({ label: `${x.table}.${x.column} · ${x.count}${x.more ? "+" : ""} row${x.count === 1 ? "" : "s"}`,
+    const items = list.filter((x) => x.count).map((x) => ({ label: `${x.table}.${x.column}${x.guessed ? " (by name)" : ""} · ${x.count}${x.more ? "+" : ""} row${x.count === 1 ? "" : "s"}`,
       run: (cx) => go(this, tab, { ...x, reverse: true }, cx) }));
     if (!items.length) { this.flash("Nothing points at this row", cx); return; }
     openMenu(this, at, items, cx);
